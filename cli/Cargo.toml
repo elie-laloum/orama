@@ -1,0 +1,17 @@
+[package]
+name = "tracer-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tracer"
+path = "src/main.rs"
+
+[dependencies]
+tracer-core = { path = "../core" }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
