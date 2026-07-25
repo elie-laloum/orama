@@ -89,7 +89,7 @@ pub fn reconstruct(raw: &str) -> Reconstructed {
             Ok(v) => v,
             Err(_) if ev.data.trim().is_empty() => continue,
             Err(e) => {
-                errors.push(format!("unparseable event data: {e}"));
+                errors.push(format!("unparsable event data: {e}"));
                 continue;
             }
         };
