@@ -6,21 +6,31 @@ use std::net::SocketAddr;
 use axum::{routing::get, Router};
 use tokio::net::TcpListener;
 
+use crate::api::{self, ReadStore};
 use crate::config::Config;
 use crate::relay::{relay, RelayState};
 use crate::store::StoreHandle;
 
-/// Build the axum router: a health probe plus a catch-all relay to upstream.
+/// Build the axum router: the read-only UI/API, a health probe, and a catch-all
+/// relay to upstream.
 ///
-/// The health probe is registered on a dedicated path; every other path/method
-/// falls through to the transparent relay. Pass a [`StoreHandle`] to enable
-/// capture; `None` gives a pure pass-through proxy.
+/// The UI/API and health probe are registered on dedicated paths; every other
+/// path/method falls through to the transparent relay. Pass a [`StoreHandle`]
+/// to enable capture; `None` gives a pure pass-through proxy.
 pub fn router(config: Config, store: Option<StoreHandle>) -> Router {
     let state = RelayState::with_store(config.upstream.clone(), store);
-    Router::new()
+    let read_store = ReadStore::new(config.db_path.clone());
+
+    // The relay/health routes carry RelayState; finalise that state before
+    // merging with the already-stated read-only API/UI router.
+    let relay_router = Router::new()
         .route("/healthz", get(healthz))
         .fallback(relay)
-        .with_state(state)
+        .with_state(state);
+
+    Router::new()
+        .merge(api::routes(read_store))
+        .merge(relay_router)
 }
 
 /// Health probe endpoint — returns a success response so callers can confirm

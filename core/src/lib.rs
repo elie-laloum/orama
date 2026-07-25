@@ -4,6 +4,7 @@
 //! later Tauri desktop app can depend on it directly. The `cli` crate is a thin
 //! binary wrapper.
 
+pub mod api;
 pub mod config;
 pub mod reconstruct;
 pub mod relay;

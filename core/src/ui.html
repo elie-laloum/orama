@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tracer — captured calls</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
+    --muted: #8b93a7; --accent: #6ea8fe; --err: #ff6b6b; --ok: #51cf66;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--bg); color: var(--fg); }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  button { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    padding: 4px 10px; border-radius: 6px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  .layout { display: grid; grid-template-columns: minmax(340px, 1fr) 2fr; height: calc(100vh - 45px); }
+  .list { overflow-y: auto; border-right: 1px solid var(--line); }
+  .row { padding: 8px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .row:hover { background: var(--panel); }
+  .row.active { background: var(--panel); border-left: 3px solid var(--accent); }
+  .row .top { display: flex; gap: 8px; align-items: baseline; }
+  .row .method { color: var(--accent); font-weight: 600; }
+  .row .url { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .meta { color: var(--muted); font-size: 12px; display: flex; gap: 10px; margin-top: 2px; }
+  .badge { font-size: 11px; padding: 0 6px; border-radius: 4px; border: 1px solid var(--line); }
+  .badge.stream { color: var(--accent); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  .status-2 { color: var(--ok); } .status-4, .status-5 { color: var(--err); }
+  .detail { overflow-y: auto; padding: 16px; }
+  .detail .empty { color: var(--muted); margin-top: 40px; text-align: center; }
+  .section { margin-bottom: 18px; }
+  .section h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted); }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
+  .kv .k { color: var(--muted); }
+  .err-text { color: var(--err); }
+</style>
+</head>
+<body>
+<header>
+  <h1>tracer</h1>
+  <span class="spacer"></span>
+  <span id="count" style="color:var(--muted)"></span>
+  <button id="refresh">Refresh</button>
+</header>
+<div class="layout">
+  <div class="list" id="list"></div>
+  <div class="detail" id="detail"><div class="empty">Select a call to inspect it.</div></div>
+</div>
+<script>
+// The tracer renders captured, potentially untrusted request/response bodies.
+// Everything below builds DOM via createElement + textContent (never innerHTML)
+// so no captured string can inject markup or script.
+const listEl = document.getElementById('list');
+const detailEl = document.getElementById('detail');
+const countEl = document.getElementById('count');
+let selectedId = null;
+
+// --- tiny safe DOM helpers ---
+function el(tag, opts = {}, children = []) {
+  const node = document.createElement(tag);
+  if (opts.class) node.className = opts.class;
+  if (opts.title != null) node.title = String(opts.title);
+  if (opts.text != null) node.textContent = String(opts.text);
+  if (opts.onclick) node.onclick = opts.onclick;
+  for (const child of children) {
+    if (child) node.append(child);
+  }
+  return node;
+}
+function clear(node) {
+  node.replaceChildren();
+}
+
+function statusClass(s) {
+  if (s == null) return '';
+  return 'status-' + String(s)[0];
+}
+
+function fmtTime(t) {
+  if (!t) return '';
+  try { return new Date(t).toLocaleTimeString(); } catch { return t; }
+}
+
+async function loadList() {
+  const res = await fetch('/api/calls');
+  const data = await res.json();
+  const calls = data.calls || [];
+  countEl.textContent = calls.length + ' call' + (calls.length === 1 ? '' : 's');
+  clear(listEl);
+  for (const c of calls) {
+    const row = el('div', {
+      class: 'row' + (c.id === selectedId ? ' active' : ''),
+      onclick: () => selectCall(c.id),
+    });
+
+    const top = el('div', { class: 'top' }, [
+      el('span', { class: 'method', text: c.method }),
+      el('span', { class: 'url', title: c.url, text: c.url }),
+    ]);
+
+    const meta = el('div', { class: 'meta' }, [
+      el('span', { text: fmtTime(c.timestamp_start) }),
+      el('span', { text: c.model || '' }),
+      el('span', { class: statusClass(c.status), text: c.status != null ? c.status : '—' }),
+      c.is_stream ? el('span', { class: 'badge stream', text: 'stream' }) : null,
+      c.has_error ? el('span', { class: 'badge err', text: 'error' }) : null,
+    ]);
+
+    row.append(top, meta);
+    listEl.append(row);
+  }
+}
+
+function pretty(v) {
+  if (v == null) return null;
+  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+}
+
+// Build a titled <pre> section, or nothing when there is no content.
+function section(title, content, extraClass) {
+  if (content == null || content === '') return null;
+  const pre = el('pre', { text: content });
+  if (extraClass) pre.className = extraClass;
+  return el('div', { class: 'section' }, [el('h3', { text: title }), pre]);
+}
+
+function kvRow(k, v, valueClass) {
+  const key = el('span', { class: 'k', text: k });
+  const val = el('span', { text: v == null ? '—' : String(v) });
+  if (valueClass) val.className = valueClass;
+  return [key, val];
+}
+
+async function selectCall(id) {
+  selectedId = id;
+  const res = await fetch('/api/calls/' + id);
+  if (!res.ok) {
+    clear(detailEl);
+    detailEl.append(el('div', { class: 'empty', text: 'Not found.' }));
+    return;
+  }
+  const c = await res.json();
+  await loadList(); // reflect active state
+
+  const body = c.request_body || {};
+  const system = body.system;
+  const messages = body.messages;
+  const tools = body.tools;
+  const response = c.response_reconstructed;
+
+  const kv = el('div', { class: 'kv' }, [
+    ...kvRow('id', c.id),
+    ...kvRow('method', c.method),
+    ...kvRow('url', c.url),
+    ...kvRow('model', c.model || ''),
+    ...kvRow('status', c.response_status ?? '—', statusClass(c.response_status)),
+    ...kvRow('stream', c.is_stream),
+    ...kvRow('start', c.timestamp_start || ''),
+    ...kvRow('first chunk', c.timestamp_first_chunk || '—'),
+    ...kvRow('end', c.timestamp_end || ''),
+  ]);
+
+  clear(detailEl);
+  detailEl.append(el('div', { class: 'section' }, [kv]));
+
+  const sections = [
+    c.error ? section('Error', c.error, 'err-text') : null,
+    section('System prompt', typeof system === 'string' ? system : pretty(system)),
+    section('Messages', pretty(messages)),
+    section('Tools', pretty(tools)),
+    section('Response (reconstructed)', pretty(response)),
+    section('Request headers', pretty(c.request_headers)),
+    section('Response headers', pretty(c.response_headers)),
+    c.is_stream ? section('Raw SSE', c.response_raw_sse) : null,
+  ];
+  for (const s of sections) {
+    if (s) detailEl.append(s);
+  }
+}
+
+document.getElementById('refresh').onclick = loadList;
+loadList();
+</script>
+</body>
+</html>
