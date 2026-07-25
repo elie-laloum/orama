@@ -5,6 +5,7 @@
 //! binary wrapper.
 
 pub mod config;
+pub mod reconstruct;
 pub mod relay;
 pub mod server;
 pub mod store;

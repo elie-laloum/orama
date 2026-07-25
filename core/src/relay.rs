@@ -261,10 +261,23 @@ fn stream_teeing_response(
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
-/// Hook for ticket 05 to reconstruct the assembled JSON from the raw SSE. In
-/// this ticket it is a no-op so streaming capture stores the verbatim stream and
-/// timing only.
-fn finalize_stream_record(_record: &mut CallRecord) {}
+/// Reconstruct the assembled JSON response from the captured raw SSE and store
+/// it alongside the verbatim stream. Best-effort: a partial/malformed stream
+/// records what it can plus an error note, and any existing stream error is
+/// preserved.
+fn finalize_stream_record(record: &mut CallRecord) {
+    let Some(raw) = record.response_raw_sse.as_ref() else {
+        return;
+    };
+    let result = crate::reconstruct::reconstruct(raw);
+    record.response_reconstructed = result.message;
+    if let Some(err) = result.error {
+        record.error = Some(match record.error.take() {
+            Some(existing) => format!("{existing}; reconstruct: {err}"),
+            None => format!("reconstruct: {err}"),
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {

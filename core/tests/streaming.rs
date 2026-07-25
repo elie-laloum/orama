@@ -20,11 +20,11 @@ use tracer_core::{server::router, store::list_calls, Config};
 async fn sse_upstream() -> Response {
     let stream = async_stream::stream! {
         yield Ok::<_, std::io::Error>(bytes::Bytes::from(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5}}}\n\n",
         ));
         sleep(Duration::from_millis(100)).await;
         yield Ok(bytes::Bytes::from(
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
         ));
         sleep(Duration::from_millis(100)).await;
         yield Ok(bytes::Bytes::from(
@@ -120,6 +120,13 @@ async fn streaming_is_teed_live_and_persisted() {
     assert_eq!(raw, &collected, "stored SSE is verbatim");
     assert!(call.timestamp_first_chunk.is_some(), "TTFT derivable");
     assert!(call.timestamp_end.is_some(), "latency derivable");
+
+    // Reconstructed JSON carries both verbatim and assembled forms.
+    let recon = call
+        .response_reconstructed
+        .as_ref()
+        .expect("reconstructed JSON stored");
+    assert_eq!(recon["content"][0]["text"], "hi");
 
     let _ = std::fs::remove_file(&db);
 }
