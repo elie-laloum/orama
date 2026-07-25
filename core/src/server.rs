@@ -7,10 +7,18 @@ use axum::{routing::get, Router};
 use tokio::net::TcpListener;
 
 use crate::config::Config;
+use crate::relay::{relay, RelayState};
 
-/// Build the axum router. For ticket 01 this only exposes a health probe.
-pub fn router(_config: Config) -> Router {
-    Router::new().route("/healthz", get(healthz))
+/// Build the axum router: a health probe plus a catch-all relay to upstream.
+///
+/// The health probe is registered on a dedicated path; every other path/method
+/// falls through to the transparent relay.
+pub fn router(config: Config) -> Router {
+    let state = RelayState::new(config.upstream.clone());
+    Router::new()
+        .route("/healthz", get(healthz))
+        .fallback(relay)
+        .with_state(state)
 }
 
 /// Health probe endpoint — returns a success response so callers can confirm

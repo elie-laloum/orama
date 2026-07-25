@@ -5,6 +5,7 @@
 //! binary wrapper.
 
 pub mod config;
+pub mod relay;
 pub mod server;
 
 pub use config::Config;
