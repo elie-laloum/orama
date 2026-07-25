@@ -92,7 +92,7 @@ pub async fn relay(
     };
 
     // Build the request half of the record up front (redaction happens on write).
-    let mut record = CallRecord {
+    let record = CallRecord {
         timestamp_start,
         method: method.to_string(),
         url: uri
@@ -104,48 +104,45 @@ pub async fn relay(
         ..Default::default()
     };
 
-    let result = forward(&state, &method, &uri, &headers, body_bytes).await;
-
-    let response = match result {
-        Ok(fwd) => {
-            record.timestamp_end = Some(now_rfc3339());
-            record.response_status = Some(fwd.status as i64);
-            record.response_headers = Some(fwd.headers_json);
-            fwd.response
-        }
-        Err(err) => {
+    match forward(&state, &method, &uri, &headers, body_bytes, record).await {
+        Ok(response) => response,
+        Err((err, mut record)) => {
             // Best-effort: never hide the failure from the operator, but return
             // a clean gateway error to the client rather than panicking.
             eprintln!("tracer: relay to upstream failed: {err}");
             record.timestamp_end = Some(now_rfc3339());
             record.error = Some(format!("relay failed: {err}"));
+            if let Some(store) = &state.store {
+                store.record(record);
+            }
             (StatusCode::BAD_GATEWAY, "tracer: upstream relay failed").into_response()
         }
-    };
-
-    if let Some(store) = &state.store {
-        store.record(record);
     }
-
-    response
 }
 
-/// Outcome of a forwarded request: the client-facing response plus the captured
-/// status and response headers for persistence.
-struct Forwarded {
-    response: Response,
-    status: u16,
-    headers_json: serde_json::Value,
+/// Does this response body stream as Server-Sent Events?
+fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
 }
 
 /// Perform the outbound request and translate the upstream response back.
+///
+/// On any pre-response failure the (unfinished) record is handed back so the
+/// caller can note the error. On success, this function owns finalising and
+/// enqueuing the record — non-streaming buffers then stores; streaming tees
+/// each chunk to the client and stores when the stream ends.
 async fn forward(
     state: &RelayState,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: Vec<u8>,
-) -> anyhow::Result<Forwarded> {
+    mut record: CallRecord,
+) -> Result<Response, (anyhow::Error, CallRecord)> {
     let url = upstream_url(&state.upstream, uri);
 
     let mut req = state.client.request(method.clone(), &url);
@@ -162,13 +159,15 @@ async fn forward(
         req = req.body(body);
     }
 
-    let upstream_resp = req.send().await?;
+    let upstream_resp = match req.send().await {
+        Ok(r) => r,
+        Err(err) => return Err((err.into(), record)),
+    };
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
-    let resp_body = upstream_resp.bytes().await?;
-
-    let headers_json = headers_to_json(&resp_headers);
+    record.response_status = Some(status.as_u16() as i64);
+    record.response_headers = Some(headers_to_json(&resp_headers));
 
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in resp_headers.iter() {
@@ -188,15 +187,84 @@ async fn forward(
         }
     }
 
-    let response = builder
-        .body(Body::from(resp_body))
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-    Ok(Forwarded {
-        response,
-        status: status.as_u16(),
-        headers_json,
-    })
+    if is_event_stream(&resp_headers) {
+        Ok(stream_teeing_response(builder, upstream_resp, record, state.store.clone()))
+    } else {
+        // Non-streaming: buffer the whole body, store, and return unchanged.
+        let resp_body = match upstream_resp.bytes().await {
+            Ok(b) => b,
+            Err(err) => return Err((err.into(), record)),
+        };
+        record.timestamp_end = Some(now_rfc3339());
+        if let Some(store) = &state.store {
+            store.record(record);
+        }
+        let response = builder
+            .body(Body::from(resp_body))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+        Ok(response)
+    }
 }
+
+/// Build a streaming response that forwards each upstream SSE chunk to the
+/// client the instant it arrives while accumulating a verbatim copy. When the
+/// stream ends (or errors), the record is finalised with the raw SSE, the
+/// first-chunk/end timestamps, and any error, then enqueued for persistence.
+fn stream_teeing_response(
+    builder: axum::http::response::Builder,
+    upstream_resp: reqwest::Response,
+    record: CallRecord,
+    store: Option<StoreHandle>,
+) -> Response {
+    use futures::StreamExt;
+
+    let mut upstream = upstream_resp.bytes_stream();
+    let mut record = record;
+    let mut raw_sse = String::new();
+    let mut first_chunk_at: Option<String> = None;
+
+    let tee = async_stream::stream! {
+        loop {
+            match upstream.next().await {
+                Some(Ok(chunk)) => {
+                    if first_chunk_at.is_none() {
+                        first_chunk_at = Some(now_rfc3339());
+                    }
+                    // Accumulate a verbatim copy (lossy UTF-8 for storage only;
+                    // the bytes forwarded to the client are untouched).
+                    raw_sse.push_str(&String::from_utf8_lossy(&chunk));
+                    // Forward the exact bytes downstream immediately.
+                    yield Ok::<_, std::io::Error>(chunk);
+                }
+                Some(Err(err)) => {
+                    // A mid-stream upstream error: surface it, record it, and
+                    // stop. The client stream ends here rather than hanging.
+                    eprintln!("tracer: upstream stream error: {err}");
+                    record.error = Some(format!("stream error: {err}"));
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        record.timestamp_first_chunk = first_chunk_at.clone();
+        record.timestamp_end = Some(now_rfc3339());
+        record.response_raw_sse = Some(raw_sse.clone());
+        finalize_stream_record(&mut record);
+        if let Some(store) = &store {
+            store.record(record.clone());
+        }
+    };
+
+    builder
+        .body(Body::from_stream(tee))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Hook for ticket 05 to reconstruct the assembled JSON from the raw SSE. In
+/// this ticket it is a no-op so streaming capture stores the verbatim stream and
+/// timing only.
+fn finalize_stream_record(_record: &mut CallRecord) {}
 
 #[cfg(test)]
 mod tests {
