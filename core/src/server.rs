@@ -8,13 +8,15 @@ use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::relay::{relay, RelayState};
+use crate::store::StoreHandle;
 
 /// Build the axum router: a health probe plus a catch-all relay to upstream.
 ///
 /// The health probe is registered on a dedicated path; every other path/method
-/// falls through to the transparent relay.
-pub fn router(config: Config) -> Router {
-    let state = RelayState::new(config.upstream.clone());
+/// falls through to the transparent relay. Pass a [`StoreHandle`] to enable
+/// capture; `None` gives a pure pass-through proxy.
+pub fn router(config: Config, store: Option<StoreHandle>) -> Router {
+    let state = RelayState::with_store(config.upstream.clone(), store);
     Router::new()
         .route("/healthz", get(healthz))
         .fallback(relay)
@@ -41,15 +43,29 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         host: local.ip(),
         port: local.port(),
         upstream: config.upstream.clone(),
+        db_path: config.db_path.clone(),
+    };
+
+    // Open the DB and spawn the background writer that owns the connection.
+    let store = match crate::store::spawn_writer(&effective.db_path) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            eprintln!(
+                "tracer: could not open database at {}: {err} — running without capture",
+                effective.db_path.display()
+            );
+            None
+        }
     };
 
     println!("tracer proxy listening on {local}");
     println!("upstream: {}", effective.upstream);
+    println!("capture db: {}", effective.db_path.display());
     println!("\n# paste into the shell that runs Claude Code:");
     println!("{}", effective.export_snippet());
     println!("\n# open the UI at {}/ui", effective.public_base_url());
 
-    let app = router(effective);
+    let app = router(effective, store);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -66,7 +82,7 @@ mod tests {
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(cfg);
+        let app = router(cfg, None);
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });

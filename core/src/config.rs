@@ -1,12 +1,16 @@
 //! Runtime configuration for the tracer proxy.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 
 /// Default upstream Anthropic API base URL.
 pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
 
 /// Default port the proxy listens on.
 pub const DEFAULT_PORT: u16 = 8787;
+
+/// Default SQLite database filename.
+pub const DEFAULT_DB: &str = "tracer.sqlite";
 
 /// Configuration for a running proxy instance.
 #[derive(Debug, Clone)]
@@ -17,6 +21,8 @@ pub struct Config {
     pub port: u16,
     /// Upstream base URL every request is relayed to (no trailing slash).
     pub upstream: String,
+    /// Path to the SQLite database file capture is written to.
+    pub db_path: PathBuf,
 }
 
 impl Default for Config {
@@ -25,6 +31,7 @@ impl Default for Config {
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: DEFAULT_PORT,
             upstream: DEFAULT_UPSTREAM.to_string(),
+            db_path: PathBuf::from(DEFAULT_DB),
         }
     }
 }
@@ -38,7 +45,14 @@ impl Config {
             host,
             port,
             upstream,
+            db_path: PathBuf::from(DEFAULT_DB),
         }
+    }
+
+    /// Override the SQLite database path (builder style).
+    pub fn with_db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.db_path = path.into();
+        self
     }
 
     /// The base URL a client (Claude Code) should point `ANTHROPIC_BASE_URL` at.

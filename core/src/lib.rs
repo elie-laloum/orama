@@ -7,6 +7,8 @@
 pub mod config;
 pub mod relay;
 pub mod server;
+pub mod store;
+pub mod util;
 
 pub use config::Config;
 pub use server::serve;

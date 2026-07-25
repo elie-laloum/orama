@@ -12,15 +12,24 @@ use axum::{
 };
 use std::sync::Arc;
 
+use crate::store::{CallRecord, StoreHandle};
+use crate::util::{body_to_json, headers_to_json, now_rfc3339};
+
 /// Shared state handed to the catch-all handler.
 #[derive(Clone)]
 pub struct RelayState {
     pub client: reqwest::Client,
     pub upstream: Arc<str>,
+    /// Optional capture sink. When `None`, the relay is pure pass-through.
+    pub store: Option<StoreHandle>,
 }
 
 impl RelayState {
     pub fn new(upstream: impl Into<String>) -> Self {
+        Self::with_store(upstream, None)
+    }
+
+    pub fn with_store(upstream: impl Into<String>, store: Option<StoreHandle>) -> Self {
         let client = reqwest::Client::builder()
             // Claude Code manages its own timeouts; don't impose our own on the
             // relay path or we could truncate long agentic calls.
@@ -29,6 +38,7 @@ impl RelayState {
         Self {
             client,
             upstream: Arc::from(upstream.into()),
+            store,
         }
     }
 }
@@ -61,6 +71,9 @@ fn upstream_url(upstream: &str, uri: &Uri) -> String {
 
 /// Catch-all handler: forward any method/path verbatim to upstream and return
 /// the upstream response unchanged. Auth headers are passed through untouched.
+///
+/// Capture is best-effort and off the critical path: the request is relayed
+/// regardless of whether a record can be built or persisted.
 pub async fn relay(
     State(state): State<RelayState>,
     method: Method,
@@ -68,23 +81,61 @@ pub async fn relay(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let timestamp_start = now_rfc3339();
+
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
+        Ok(b) => b.to_vec(),
         Err(err) => {
             eprintln!("tracer: failed to read request body: {err}");
             return (StatusCode::BAD_GATEWAY, "tracer: bad request body").into_response();
         }
     };
 
-    match forward(&state, &method, &uri, &headers, body_bytes.to_vec()).await {
-        Ok(resp) => resp,
+    // Build the request half of the record up front (redaction happens on write).
+    let mut record = CallRecord {
+        timestamp_start,
+        method: method.to_string(),
+        url: uri
+            .path_and_query()
+            .map(|pq| pq.to_string())
+            .unwrap_or_else(|| uri.path().to_string()),
+        request_headers: headers_to_json(&headers),
+        request_body: body_to_json(&body_bytes),
+        ..Default::default()
+    };
+
+    let result = forward(&state, &method, &uri, &headers, body_bytes).await;
+
+    let response = match result {
+        Ok(fwd) => {
+            record.timestamp_end = Some(now_rfc3339());
+            record.response_status = Some(fwd.status as i64);
+            record.response_headers = Some(fwd.headers_json);
+            fwd.response
+        }
         Err(err) => {
             // Best-effort: never hide the failure from the operator, but return
             // a clean gateway error to the client rather than panicking.
             eprintln!("tracer: relay to upstream failed: {err}");
+            record.timestamp_end = Some(now_rfc3339());
+            record.error = Some(format!("relay failed: {err}"));
             (StatusCode::BAD_GATEWAY, "tracer: upstream relay failed").into_response()
         }
+    };
+
+    if let Some(store) = &state.store {
+        store.record(record);
     }
+
+    response
+}
+
+/// Outcome of a forwarded request: the client-facing response plus the captured
+/// status and response headers for persistence.
+struct Forwarded {
+    response: Response,
+    status: u16,
+    headers_json: serde_json::Value,
 }
 
 /// Perform the outbound request and translate the upstream response back.
@@ -94,7 +145,7 @@ async fn forward(
     uri: &Uri,
     headers: &HeaderMap,
     body: Vec<u8>,
-) -> anyhow::Result<Response> {
+) -> anyhow::Result<Forwarded> {
     let url = upstream_url(&state.upstream, uri);
 
     let mut req = state.client.request(method.clone(), &url);
@@ -117,6 +168,8 @@ async fn forward(
     let resp_headers = upstream_resp.headers().clone();
     let resp_body = upstream_resp.bytes().await?;
 
+    let headers_json = headers_to_json(&resp_headers);
+
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in resp_headers.iter() {
         if is_hop_by_hop(name) {
@@ -138,7 +191,11 @@ async fn forward(
     let response = builder
         .body(Body::from(resp_body))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-    Ok(response)
+    Ok(Forwarded {
+        response,
+        status: status.as_u16(),
+        headers_json,
+    })
 }
 
 #[cfg(test)]

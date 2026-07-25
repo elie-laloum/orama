@@ -30,6 +30,10 @@ enum Command {
         /// Upstream Anthropic-compatible API base URL.
         #[arg(long, default_value = DEFAULT_UPSTREAM)]
         upstream: String,
+
+        /// Path to the SQLite capture database.
+        #[arg(long, default_value = "tracer.sqlite")]
+        db: std::path::PathBuf,
     },
 }
 
@@ -49,8 +53,9 @@ async fn main() -> anyhow::Result<()> {
             port,
             host,
             upstream,
+            db,
         } => {
-            let config = Config::new(host, port, upstream);
+            let config = Config::new(host, port, upstream).with_db_path(db);
             tracer_core::serve(config).await?;
         }
     }

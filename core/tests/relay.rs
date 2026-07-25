@@ -86,7 +86,7 @@ async fn relay_forwards_verbatim_and_returns_unchanged() {
         0,
         format!("http://{upstream_addr}"),
     );
-    let proxy_app = router(cfg);
+    let proxy_app = router(cfg, None);
     let proxy_addr = spawn(proxy_app).await;
 
     // 3. Client request through the proxy, with an auth token.
@@ -125,7 +125,7 @@ async fn relay_failure_returns_gateway_error_not_panic() {
         0,
         "http://127.0.0.1:1", // unroutable
     );
-    let proxy_addr = spawn(router(cfg)).await;
+    let proxy_addr = spawn(router(cfg, None)).await;
 
     let client = reqwest::Client::new();
     let resp = client
