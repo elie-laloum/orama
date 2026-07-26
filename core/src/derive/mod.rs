@@ -26,7 +26,7 @@ pub use model::{
 
 /// Bumping this invalidates every derived row and triggers a rebuild. Raw
 /// captures are never touched by the rebuild.
-pub const PARSER_VERSION: &str = "2026-07-26.2";
+pub const PARSER_VERSION: &str = "2026-07-26.4";
 
 /// Longest excerpt kept for a tool input or result. Full content stays in
 /// `calls`; derived rows exist to be scanned, not to duplicate 260 KB bodies.
@@ -34,6 +34,22 @@ const EXCERPT_CHARS: usize = 400;
 
 /// Longest user-prompt excerpt stored on a generation.
 const PROMPT_CHARS: usize = 512;
+
+/// Is this capture a model inference request, as opposed to something else the
+/// harness sent down the same connection?
+///
+/// The relay is a catch-all, so `calls` holds every round trip a harness makes:
+/// model listings, health probes, and — from Codex — a `GET` WebSocket upgrade
+/// that the backend answers with 405 before the real request is even sent.
+/// Deriving a generation from those invented rows with no model, no tokens and
+/// no cost, and counted the failed upgrade probes as errored generations, which
+/// made a working session look like it was mostly failing.
+///
+/// Every inference API in scope posts a body, so that pair is the whole test.
+/// The raw capture is kept either way and stays addressable by `call_id`.
+pub fn is_inference_call(call: &StoredCall) -> bool {
+    call.record.method.eq_ignore_ascii_case("POST") && call.record.request_body.is_some()
+}
 
 /// Build the derived rows for one raw capture.
 pub fn derive_one(call: &StoredCall) -> Derived {

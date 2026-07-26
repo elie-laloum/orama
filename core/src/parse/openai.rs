@@ -24,14 +24,13 @@ impl ProviderParser for OpenAiParser {
     fn parse(&self, call: &StoredCall) -> NormalizedCall {
         let record = &call.record;
         let body = record.request_body.as_ref();
-        let system = body.map(system_segments).unwrap_or_default();
-        let declared_tools = body.map(tool_declarations).unwrap_or_default();
+        let Request {
+            system,
+            declared_tools,
+            turns,
+        } = body.map(split_request).unwrap_or_default();
 
-        let mut thread: Vec<Turn> = body
-            .and_then(|body| body.get("messages").or_else(|| body.get("input")))
-            .and_then(Value::as_array)
-            .map(|items| items.iter().map(request_turn).collect())
-            .unwrap_or_default();
+        let mut thread: Vec<Turn> = turns.iter().map(request_turn).collect();
 
         let response = record
             .response_reconstructed
@@ -74,6 +73,12 @@ impl ProviderParser for OpenAiParser {
 /// OpenAI has no session header of its own, so this leans on what the harnesses
 /// send: Codex forwards a session id, and the Responses API threads state
 /// through `previous_response_id`.
+///
+/// `session-id` leads because that is what Codex actually sends — the
+/// underscore and `x-`-prefixed spellings below were guesses that no real
+/// client uses, and while they were the only candidates every Codex call
+/// derived with a null `session_id`. That left the capture invisible to every
+/// surface keyed on sessions, which is most of them.
 fn session_key(headers: &Value, body: Option<&Value>) -> Option<String> {
     let header = |name: &str| {
         headers
@@ -81,9 +86,14 @@ fn session_key(headers: &Value, body: Option<&Value>) -> Option<String> {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .and_then(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
             .map(String::from)
     };
-    header("session_id")
+    header("session-id")
+        // One Codex run carries the same value in both; `thread-id` survives if
+        // the run identifier ever stops being sent.
+        .or_else(|| header("thread-id"))
+        .or_else(|| header("session_id"))
         .or_else(|| header("x-session-id"))
         .or_else(|| header("x-codex-session-id"))
         .or_else(|| {
@@ -93,48 +103,103 @@ fn session_key(headers: &Value, body: Option<&Value>) -> Option<String> {
         })
 }
 
-/// Instructions, whether sent as a `system`/`developer` turn or as the
-/// Responses API's top-level `instructions` field.
-fn system_segments(body: &Value) -> Vec<SystemSegment> {
-    let mut segments = Vec::new();
+/// A request split into what the harness declares and what the conversation
+/// says. The three are disjoint by construction: a system segment is never also
+/// a turn, so `system_chars` and `context_chars` cannot double-count it.
+#[derive(Default)]
+struct Request<'a> {
+    system: Vec<SystemSegment>,
+    declared_tools: Vec<ToolDecl>,
+    turns: &'a [Value],
+}
+
+/// Separate the harness from the conversation.
+///
+/// Chat Completions puts instructions in `messages[]` and tools at the top
+/// level. The Responses API has an `instructions` field — but Codex uses
+/// neither: it packs its whole harness into the leading items of `input[]`, as
+/// `developer` messages plus one `additional_tools` envelope. Read only as
+/// turns, those 30k of prompt and 24k of tool schemas were reported as
+/// conversation, and the harness looked empty.
+///
+/// The boundary is the *leading run*: the first item that is not
+/// `system`/`developer` opens the conversation, and a system turn appearing
+/// after that stays a turn. It is injected content rather than the harness, and
+/// folding it in would give the prompt a different fingerprint on every call —
+/// one Harness row per call instead of one per harness.
+fn split_request(body: &Value) -> Request<'_> {
+    let mut system = Vec::new();
+    let mut declared_tools = tool_declarations(body.get("tools"));
+
     if let Some(text) = body.get("instructions").and_then(Value::as_str) {
-        segments.push(SystemSegment {
-            text: text.to_owned(),
-            approx_size: ApproxSize::of_text(text),
-            cache_control: false,
-        });
+        system.push(system_segment(text));
     }
+
     let items = body
         .get("messages")
+        .or_else(|| body.get("input"))
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten();
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    let mut start = 0;
     for item in items {
         let role = item.get("role").and_then(Value::as_str).unwrap_or("");
         if role != "system" && role != "developer" {
+            break;
+        }
+        start += 1;
+        // A declaration envelope, not a segment: it carries `role: developer`
+        // but no content, so treating it as one would emit an empty segment
+        // ahead of the real prompt and leave the harness unidentifiable.
+        if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+            declared_tools.extend(tool_declarations(item.get("tools")));
             continue;
         }
         let text = content_text(item.get("content")).unwrap_or_default();
-        segments.push(SystemSegment {
-            text: text.clone(),
-            approx_size: ApproxSize::of_text(&text),
-            cache_control: false,
-        });
+        if !text.is_empty() {
+            system.push(system_segment(&text));
+        }
     }
-    segments
+
+    Request {
+        system,
+        declared_tools,
+        turns: &items[start..],
+    }
+}
+
+/// OpenAI has no `cache_control` marker — the provider caches implicitly and the
+/// client never declares a breakpoint.
+fn system_segment(text: &str) -> SystemSegment {
+    SystemSegment {
+        text: text.to_owned(),
+        approx_size: ApproxSize::of_text(text),
+        cache_control: false,
+    }
 }
 
 /// Tool declarations, in either the flat or the nested `function` shape.
-fn tool_declarations(body: &Value) -> Vec<ToolDecl> {
-    body.get("tools")
+///
+/// Codex groups related tools under a `namespace` entry whose own `tools` array
+/// holds the real functions, so this flattens rather than counting the group as
+/// one declaration.
+fn tool_declarations(tools: Option<&Value>) -> Vec<ToolDecl> {
+    tools
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|tool| {
+        .flat_map(|tool| {
+            if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+                return tool_declarations(tool.get("tools"));
+            }
             // Chat Completions nests under `function`; Responses is flat.
             let spec = tool.get("function").unwrap_or(tool);
-            Some(ToolDecl {
-                name: spec.get("name")?.as_str()?.to_owned(),
+            let Some(name) = spec.get("name").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            vec![ToolDecl {
+                name: name.to_owned(),
                 description: spec
                     .get("description")
                     .and_then(Value::as_str)
@@ -142,8 +207,11 @@ fn tool_declarations(body: &Value) -> Vec<ToolDecl> {
                 input_schema: spec
                     .get("parameters")
                     .or_else(|| spec.get("input_schema"))
+                    // A `custom` tool states its contract as a grammar instead
+                    // of a JSON schema. Those are bytes on the wire too.
+                    .or_else(|| spec.get("format"))
                     .cloned(),
-            })
+            }]
         })
         .collect()
 }
@@ -518,6 +586,96 @@ mod tests {
             .iter()
             .flat_map(|turn| &turn.blocks)
             .any(|block| matches!(block.kind, BlockKind::ToolResult)));
+    }
+
+    /// The shape Codex actually sends: no `instructions`, no top-level `tools`,
+    /// and the whole harness packed into the leading `input[]` items.
+    #[test]
+    fn codex_packs_its_harness_into_the_leading_input_items() {
+        let stored = call(
+            json!({
+                "model": "gpt-5.6-luna",
+                "input": [
+                    {"role": "developer", "type": "additional_tools", "tools": [
+                        {"type": "custom", "name": "exec", "description": "run js",
+                         "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}},
+                        {"type": "function", "name": "wait", "description": "wait",
+                         "parameters": {"type": "object"}},
+                        {"type": "namespace", "name": "collaboration", "description": "group",
+                         "tools": [
+                            {"type": "function", "name": "spawn_agent", "parameters": {}},
+                            {"type": "function", "name": "wait_agent", "parameters": {}}
+                         ]}
+                    ]},
+                    {"role": "developer", "type": "message",
+                     "content": [{"type": "input_text", "text": "You are Codex."}]},
+                    {"role": "developer", "type": "message", "content": [
+                        {"type": "input_text", "text": "AGENTS.md says "},
+                        {"type": "input_text", "text": "be terse."}
+                    ]},
+                    {"role": "user", "type": "message",
+                     "content": [{"type": "input_text", "text": "who are you"}]}
+                ]
+            }),
+            json!({"output": [{"type": "message",
+                               "content": [{"type": "output_text", "text": "Codex."}]}]}),
+        );
+
+        let parsed = OpenAiParser.parse(&stored);
+
+        // The two developer messages are the prompt. The tool envelope carries
+        // no content, so it contributes no segment.
+        assert_eq!(parsed.system.len(), 2);
+        assert_eq!(parsed.system[0].text, "You are Codex.");
+        assert_eq!(parsed.system[1].text, "AGENTS.md says be terse.");
+
+        // A namespace is a grouping, not a declaration: its members are.
+        let names: Vec<&str> = parsed
+            .declared_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, ["exec", "wait", "spawn_agent", "wait_agent"]);
+        // A `custom` tool declares its contract as a grammar, not a schema.
+        assert!(parsed.declared_tools[0].input_schema.is_some());
+
+        // Only the conversation is a conversation: one user turn plus the
+        // response. Counting the harness here is what reported a 31k request as
+        // 100% conversation with an empty system prompt.
+        assert_eq!(parsed.thread.len(), 2);
+        assert!(matches!(parsed.thread[0].role, Role::User));
+        assert!(matches!(parsed.thread[1].origin, Origin::New));
+    }
+
+    /// The split is the *leading* run, so injected content stays conversation.
+    #[test]
+    fn a_system_turn_after_the_conversation_starts_is_not_the_harness() {
+        let stored = call(
+            json!({
+                "model": "gpt-x",
+                "messages": [
+                    {"role": "system", "content": "Be terse."},
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "content": "skill instructions, injected"},
+                    {"role": "user", "content": "again"}
+                ]
+            }),
+            json!({"choices": []}),
+        );
+
+        let parsed = OpenAiParser.parse(&stored);
+        assert_eq!(
+            parsed.system.len(),
+            1,
+            "only the leading run is the harness"
+        );
+        assert_eq!(parsed.system[0].text, "Be terse.");
+        assert_eq!(parsed.thread.len(), 3);
+        assert!(
+            matches!(parsed.thread[1].role, Role::System),
+            "an inline system turn keeps its role: {:?}",
+            parsed.thread[1].role
+        );
     }
 
     #[test]

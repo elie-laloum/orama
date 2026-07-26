@@ -310,6 +310,11 @@ pub fn record_failure(conn: &Connection, call_id: i64, stage: &str, error: &str,
 /// Returns the session the capture belongs to, so the caller can refresh just
 /// that session's rollup.
 pub fn derive_and_write(conn: &Connection, call: &StoredCall) -> Option<String> {
+    // Not every captured round trip is a generation. Skipping is not a failure
+    // and records nothing — the raw call stays exactly where it was.
+    if !super::is_inference_call(call) {
+        return None;
+    }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| derive_one(call)));
     match outcome {
         Ok(derived) => {
@@ -398,6 +403,10 @@ pub fn backfill(conn: &Connection) -> Result<BackfillReport> {
     let calls = list_calls(conn)?;
     let wanted: std::collections::HashSet<i64> = pending.into_iter().collect();
     for call in calls.iter().filter(|call| wanted.contains(&call.id)) {
+        if !super::is_inference_call(call) {
+            report.skipped += 1;
+            continue;
+        }
         let before = failure_count(conn);
         derive_and_write(conn, call);
         if failure_count(conn) > before {

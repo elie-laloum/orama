@@ -669,3 +669,105 @@ fn openai_traffic_derives_through_the_same_pipeline() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+/// Codex on the Responses API, which declares its harness nowhere the Chat
+/// Completions shape looks: no top-level `tools`, no `instructions`, just the
+/// leading items of `input[]`.
+fn codex_responses_call() -> CallRecord {
+    CallRecord {
+        timestamp_start: "2026-07-26T09:10:00Z".into(),
+        timestamp_end: Some("2026-07-26T09:10:02Z".into()),
+        method: "POST".into(),
+        url: "/backend-api/codex/responses".into(),
+        request_headers: json!({
+            "user-agent": "codex_exec/0.145.0",
+            "session-id": "codex-session-2",
+        }),
+        request_body: Some(json!({
+            "model": "gpt-x",
+            "input": [
+                {"role": "developer", "type": "additional_tools", "tools": [
+                    {"type": "function", "name": "exec", "description": "run",
+                     "parameters": {"type": "object"}},
+                    {"type": "namespace", "name": "collaboration", "tools": [
+                        {"type": "function", "name": "spawn_agent",
+                         "parameters": {"type": "object"}}
+                    ]}
+                ]},
+                {"role": "developer", "type": "message",
+                 "content": [{"type": "input_text", "text": "You are Codex, an agent."}]},
+                {"role": "user", "type": "message",
+                 "content": [{"type": "input_text", "text": "who are you"}]}
+            ]
+        })),
+        response_status: Some(200),
+        response_body: Some(json!({
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Codex."}]}],
+            "usage": {"input_tokens": 900, "output_tokens": 10}
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_codex_responses_call_attributes_its_harness_away_from_the_conversation() {
+    let db = temp_db("codex-responses");
+    let conn = seed(&db, &[codex_responses_call()]);
+    backfill(&conn).unwrap();
+
+    let counter = |column: &str| -> Option<i64> {
+        conn.query_row(&format!("SELECT {column} FROM generations"), [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+
+    // The prompt is the harness, counted once, in the system column.
+    assert_eq!(
+        counter("system_chars"),
+        Some("You are Codex, an agent.".len() as i64)
+    );
+    assert_eq!(
+        counter("system_segments_count"),
+        Some(1),
+        "the tool envelope is not a segment"
+    );
+
+    // The namespace flattens: two callable tools, not one group.
+    assert_eq!(counter("tools_declared_count"), Some(2));
+    assert!(counter("tools_chars").unwrap() > 0);
+
+    // And the conversation is only the conversation: the one user turn plus the
+    // answer. Before the split, all of the above landed here too and the harness
+    // surface reported nothing declared.
+    assert_eq!(
+        counter("messages_count"),
+        Some(1),
+        "history turns exclude the new answer"
+    );
+    assert_eq!(
+        counter("context_chars"),
+        Some(("who are you".len() + "Codex.".len()) as i64)
+    );
+
+    // Declaring tools is what separates a working loop from a background
+    // helper: unparsed, every Codex call classified as a toolless sidechain.
+    let role: String = conn
+        .query_row("SELECT agent_role FROM generations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(role, "main");
+
+    // The harness tables are keyed by content fingerprint, so the prompt and
+    // the tool set become addressable rows for the Harness surface.
+    let prompts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM system_prompts", [], |r| r.get(0))
+        .unwrap();
+    let tools: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tool_schemas", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(prompts, 1);
+    assert_eq!(tools, 2);
+
+    let _ = std::fs::remove_file(&db);
+}
