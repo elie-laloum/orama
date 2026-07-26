@@ -7,6 +7,7 @@
 pub mod api;
 pub mod config;
 pub mod derive;
+pub mod detect;
 pub mod parse;
 pub mod pricing;
 pub mod reconstruct;

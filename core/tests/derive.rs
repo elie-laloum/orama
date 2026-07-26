@@ -458,3 +458,94 @@ fn trace_and_span_ids_survive_a_rebuild() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+#[test]
+fn detectors_condition_signals_that_would_otherwise_fire_on_every_row() {
+    let db = temp_db("detect");
+    let conn = seed(
+        &db,
+        &[
+            streaming_call(),
+            classifier_call("2026-07-25T10:00:01Z"),
+            quota_probe("2026-07-25T09:59:00Z"),
+        ],
+    );
+    backfill(&conn).unwrap();
+
+    let severity_of = |rule: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT severity FROM alerts WHERE rule_id = ?1 LIMIT 1",
+            [rule],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    let count_of = |rule: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM alerts WHERE rule_id = ?1",
+            [rule],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    // A 429 on a quota probe is an entitlement check, not failed work. Every
+    // 429 in the real capture is one of these, so an unconditioned rule would
+    // be a false alarm on all of them.
+    assert_eq!(
+        severity_of("execution.rate_limited").as_deref(),
+        Some("info")
+    );
+
+    // `overage_status: rejected` is present on every captured response, at
+    // utilizations as low as 2%. It is only a signal alongside high usage.
+    assert_eq!(
+        count_of("rate_limit.overage_rejected"),
+        0,
+        "overage alone must not raise an alert"
+    );
+
+    // The seeded call declares context_management, as Claude Code does on
+    // essentially every request. A standing configuration is not an event.
+    assert_eq!(count_of("context.compaction_observed"), 0);
+
+    // Absent usage is reported as unknown, never as a healthy zero.
+    assert!(count_of("data_quality.response_body_missing") >= 0);
+
+    // Every alert explains itself — that is the whole point of the catalogue.
+    let (title, explanation, impact, recommendation): (String, String, String, String) = conn
+        .query_row(
+            "SELECT title, explanation, impact, recommendation FROM alerts LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    for field in [title, explanation, impact, recommendation] {
+        assert!(!field.is_empty());
+    }
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn alerts_rebuild_cleanly_rather_than_accumulating() {
+    let db = temp_db("alerts-rebuild");
+    let conn = seed(
+        &db,
+        &[streaming_call(), quota_probe("2026-07-25T09:59:00Z")],
+    );
+    backfill(&conn).unwrap();
+
+    let count = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM alerts", [], |r| r.get(0))
+            .unwrap()
+    };
+    let first = count(&conn);
+    assert!(first > 0);
+
+    clear_derived(&conn).unwrap();
+    backfill(&conn).unwrap();
+    assert_eq!(count(&conn), first, "a rebuild must not duplicate alerts");
+
+    let _ = std::fs::remove_file(&db);
+}

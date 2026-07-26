@@ -165,7 +165,49 @@ const MIGRATIONS: &[Migration] = &[
         column: "depth",
         ddl: "ALTER TABLE generations ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
     },
+    // v5 — persisted, queryable alerts.
+    Migration::Sql(ALERTS_SCHEMA_V5),
 ];
+
+/// Alert storage. Derived like everything else, so a policy change rebuilds it.
+///
+/// `dedup_key` makes re-derivation idempotent and lets a recurring condition
+/// increment an occurrence count instead of producing a row per capture.
+const ALERTS_SCHEMA_V5: &str = r#"
+CREATE TABLE alerts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedup_key      TEXT NOT NULL UNIQUE,
+    rule_id        TEXT NOT NULL,
+    category       TEXT NOT NULL,
+    severity       TEXT NOT NULL,
+    confidence     TEXT NOT NULL,
+    scope_kind     TEXT NOT NULL,
+    scope_id       TEXT NOT NULL,
+    call_id        INTEGER REFERENCES calls(id) ON DELETE CASCADE,
+    span_id        TEXT,
+    trace_id       TEXT,
+    session_id     TEXT,
+    title          TEXT NOT NULL,
+    summary        TEXT NOT NULL,
+    explanation    TEXT NOT NULL,
+    impact         TEXT NOT NULL,
+    recommendation TEXT NOT NULL,
+    observed       TEXT NOT NULL,
+    metric_value   REAL,
+    threshold      REAL,
+    metric_unit    TEXT,
+    occurred_at    TEXT NOT NULL,
+    occurrences    INTEGER NOT NULL DEFAULT 1,
+    policy_version TEXT NOT NULL,
+    parser_version TEXT NOT NULL
+);
+CREATE INDEX idx_alerts_occurred ON alerts(occurred_at DESC);
+CREATE INDEX idx_alerts_severity ON alerts(severity, occurred_at DESC);
+CREATE INDEX idx_alerts_category ON alerts(category, occurred_at DESC);
+CREATE INDEX idx_alerts_rule     ON alerts(rule_id, occurred_at DESC);
+CREATE INDEX idx_alerts_session  ON alerts(session_id, occurred_at DESC);
+CREATE INDEX idx_alerts_call     ON alerts(call_id);
+"#;
 
 /// Derived-layer DDL. Kept separate for readability; applied as migration v3.
 const DERIVED_SCHEMA_V3: &str = r#"

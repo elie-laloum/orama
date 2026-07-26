@@ -263,12 +263,15 @@ pub fn derive_live(conn: &Connection, call: &StoredCall) {
     if let Err(err) = rollup_sessions(conn, Some(&session)) {
         eprintln!("tracer: failed to refresh session rollup: {err}");
     }
+    if let Err(err) = crate::detect::evaluate(conn, &crate::detect::SignalPolicy::default()) {
+        eprintln!("tracer: failed to evaluate detectors: {err}");
+    }
 }
 
 /// Drop every derived row. `calls` is untouched.
 pub fn clear_derived(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM tool_calls; DELETE FROM generations; DELETE FROM sessions; DELETE FROM derive_failures;",
+        "DELETE FROM alerts; DELETE FROM tool_calls; DELETE FROM generations; DELETE FROM sessions; DELETE FROM derive_failures;",
     )
 }
 
@@ -310,6 +313,9 @@ pub fn backfill(conn: &Connection) -> Result<BackfillReport> {
     }
     super::trace::assemble_all(conn)?;
     rollup_sessions(conn, None)?;
+    // Alerts are a pure function of the derived rows and the policy, so they
+    // are recomputed wholesale once everything else is in place.
+    crate::detect::evaluate(conn, &crate::detect::SignalPolicy::default())?;
     set_meta(conn, META_PARSER_VERSION, PARSER_VERSION)?;
     Ok(report)
 }
