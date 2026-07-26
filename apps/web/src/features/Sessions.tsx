@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { ChevronLeft } from "lucide-react";
 
 import { api } from "@/api/client";
@@ -8,7 +8,7 @@ import {
   Table, Td, Th, Tr,
 } from "@/components/ui";
 import { UNKNOWN, ago, clock, compact, modelLabel, ms, percent, truncate, usd } from "@/domain/format";
-import { Findings } from "@/features/Generations";
+import { Findings, generationHref } from "@/features/Generations";
 import { Page } from "@/features/Page";
 
 export function Sessions() {
@@ -62,6 +62,7 @@ export function Sessions() {
 
 export function SessionDetail() {
   const { id = "" } = useParams();
+  const navigate = useNavigate();
   const query = useQuery({ queryKey: ["session", id], queryFn: () => api.session(id) });
 
   if (query.isLoading) return <Loading />;
@@ -119,8 +120,10 @@ export function SessionDetail() {
               </tr>
             </thead>
             <tbody>
+              {/* Each row opens the call behind it: the shape above says a
+                  context spike happened, and this is how you find out why. */}
               {timeline.map((row) => (
-                <Tr key={row.call_id}>
+                <Tr key={row.call_id} onClick={() => navigate(generationHref(row))}>
                   <Td className="text-faint" title={clock(row.started_at)}>{ago(row.started_at)}</Td>
                   <Td><AgentPill role={row.agent_role} name={row.agent_name} /></Td>
                   <Td className="text-muted">{modelLabel(row.model)}</Td>

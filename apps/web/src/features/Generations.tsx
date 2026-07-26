@@ -38,6 +38,9 @@ import {
 } from "@/domain/format";
 import { Page } from "@/features/Page";
 
+/** Which generation's detail is open. Not a filter — see `Generations`. */
+const SPAN_PARAM = "span";
+
 const FILTERS = [
   { key: "agent_role", label: "Agent", options: ["main", "subagent", "sidechain", "probe"] },
   { key: "is_error", label: "Outcome", options: ["1", "0"], labels: { "1": "failed", "0": "ok" } },
@@ -46,7 +49,6 @@ const FILTERS = [
 
 export function Generations() {
   const [params, setParams] = useSearchParams();
-  const [selected, setSelected] = React.useState<string | null>(null);
 
   const filters: Record<string, string> = {};
   for (const { key } of FILTERS) {
@@ -59,12 +61,18 @@ export function Generations() {
     queryFn: () => api.generations({ ...filters, limit: 200 }),
   });
 
-  const setFilter = (key: string, value: string | null) => {
+  const setParam = (key: string, value: string | null) => {
     const next = new URLSearchParams(params);
     if (value) next.set(key, value);
     else next.delete(key);
     setParams(next, { replace: true });
   };
+
+  // The open detail lives in the URL rather than in state, so other surfaces
+  // can link straight to one generation. `FILTERS` is an allowlist, so `span`
+  // never reaches the API query, and the detail fetches by key independently of
+  // the list — a generation outside the current page still opens.
+  const selected = params.get(SPAN_PARAM);
 
   return (
     <Page
@@ -81,7 +89,7 @@ export function Generations() {
                 <select
                   aria-label={label}
                   value={active ?? ""}
-                  onChange={(event) => setFilter(key, event.target.value || null)}
+                  onChange={(event) => setParam(key, event.target.value || null)}
                   className="h-6 rounded-sm border border-border bg-raised px-1.5 text-2xs text-fg"
                 >
                   <option value="">any</option>
@@ -129,8 +137,8 @@ export function Generations() {
                 {query.data.generations.map((row) => (
                   <Tr
                     key={row.call_id}
-                    selected={selected === key(row)}
-                    onClick={() => setSelected(key(row))}
+                    selected={selected === generationKey(row)}
+                    onClick={() => setParam(SPAN_PARAM, generationKey(row))}
                   >
                     <Td title={clock(row.started_at)} className="text-faint">
                       {ago(row.started_at)}
@@ -168,15 +176,29 @@ export function Generations() {
         </Panel>
 
         {selected && (
-          <GenerationDetail span={selected} onClose={() => setSelected(null)} />
+          <GenerationDetail
+            span={selected}
+            onClose={() => setParam(SPAN_PARAM, null)}
+          />
         )}
       </div>
     </Page>
   );
 }
 
-function key(row: Generation) {
+/**
+ * A generation's address, here and in any surface that links to one.
+ *
+ * `/generations/:span` resolves either form, so a call that never got a span
+ * is still reachable by its id.
+ */
+export function generationKey(row: Pick<Generation, "span_id" | "call_id">) {
   return row.span_id ?? String(row.call_id);
+}
+
+/** Where to send someone who wants this generation open. */
+export function generationHref(row: Pick<Generation, "span_id" | "call_id">) {
+  return `/generations?${SPAN_PARAM}=${encodeURIComponent(generationKey(row))}`;
 }
 
 /** Context is the whole prompt, not the uncached remainder `input_tokens`. */
