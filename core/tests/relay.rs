@@ -115,6 +115,58 @@ async fn relay_forwards_verbatim_and_returns_unchanged() {
 }
 
 #[tokio::test]
+async fn each_dialect_reaches_its_own_upstream_through_one_listener() {
+    // Two distinct upstreams, so "went to the right one" is observable rather
+    // than inferred. Before per-dialect routing a Codex request was forwarded
+    // to the Anthropic upstream, which no amount of parsing could recover from.
+    let anthropic = Captured::default();
+    let openai = Captured::default();
+    let anthropic_addr = spawn(
+        Router::new()
+            .fallback(any(mock_upstream_handler))
+            .with_state(anthropic.clone()),
+    )
+    .await;
+    let openai_addr = spawn(
+        Router::new()
+            .fallback(any(mock_upstream_handler))
+            .with_state(openai.clone()),
+    )
+    .await;
+
+    let cfg = Config::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        0,
+        format!("http://{anthropic_addr}"),
+    )
+    .with_openai_upstream(format!("http://{openai_addr}"));
+    let proxy_addr = spawn(router(cfg, None)).await;
+
+    let client = reqwest::Client::new();
+    client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .body(r#"{"model":"claude-opus-5"}"#)
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("user-agent", "codex_cli_rs/1.0")
+        .body(r#"{"model":"gpt-5"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    let to_anthropic = anthropic.inner.lock().unwrap().clone().unwrap();
+    let to_openai = openai.inner.lock().unwrap().clone().unwrap();
+    assert_eq!(to_anthropic.path_and_query, "/v1/messages");
+    assert_eq!(to_anthropic.body, br#"{"model":"claude-opus-5"}"#);
+    assert_eq!(to_openai.path_and_query, "/v1/responses");
+    assert_eq!(to_openai.body, br#"{"model":"gpt-5"}"#);
+}
+
+#[tokio::test]
 async fn relay_failure_returns_gateway_error_not_panic() {
     // Proxy pointed at a dead upstream port.
     let cfg = Config::new(

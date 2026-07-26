@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod config;
+pub mod connect;
 pub mod derive;
 pub mod detect;
 pub mod parse;

@@ -12,6 +12,7 @@ import { Errors } from "@/features/Errors";
 import { Tools } from "@/features/Tools";
 import { Harness } from "@/features/Harness";
 import { Cost } from "@/features/Cost";
+import { Settings } from "@/features/Settings";
 import "@/styles/index.css";
 
 // Hash routing: the Rust binary serves one static bundle at /ui and has no
@@ -31,6 +32,7 @@ const router = createHashRouter([
       { path: "tools", element: <Tools /> },
       { path: "harness", element: <Harness /> },
       { path: "cost", element: <Cost /> },
+      { path: "settings", element: <Settings /> },
     ],
   },
 ]);

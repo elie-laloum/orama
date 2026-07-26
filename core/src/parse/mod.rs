@@ -43,8 +43,12 @@ pub fn detect(headers: &Value, url: &str) -> Provider {
     {
         return Provider::ClaudeCode;
     }
+    // `/responses` rather than `/v1/responses`: Codex on a ChatGPT
+    // subscription calls `/backend-api/codex/responses`, which carries no
+    // version segment and would otherwise fall through to `Unknown` and be
+    // stored unparsed.
     if url.contains("/chat/completions")
-        || url.contains("/v1/responses")
+        || url.contains("/responses")
         || !header("openai-organization").is_empty()
         || agent.contains("openai")
         || agent.contains("codex")

@@ -2,13 +2,15 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE.md)
 
-A local, open-source tool that transparently intercepts Claude Code's API traffic
-and shows you exactly what the harness sends on every call — the full system
-prompt, message history, declared tools, and the reconstructed response.
+A local, open-source tool that transparently intercepts a coding agent's API
+traffic and shows you exactly what the harness sends on every call — the full
+system prompt, message history, declared tools, and the reconstructed response.
 
 Unlike SDK-based tools, Orama requires **no code changes and no SDK**: it works
-with an unmodified Claude Code binary by pointing `ANTHROPIC_BASE_URL` at a local
-proxy. No MITM, no certificates.
+with an unmodified Claude Code or Codex binary by pointing its base URL at a
+local proxy. No MITM, no certificates. One listener serves both wire dialects —
+each request is routed upstream by its own format, so Claude Code and Codex can
+be traced at the same time.
 
 Everything stays on your machine. The proxy binds to `127.0.0.1` by default and
 the only network egress is the relay to the upstream API.
@@ -16,12 +18,14 @@ the only network egress is the relay to the upstream API.
 ## How it works
 
 ```text
-Claude Code ──HTTP──▶  Orama proxy  ──HTTPS──▶ api.anthropic.com
-                          │
-                          ├─ tees every request/response (streaming included)
-                          ├─ redacts auth headers, stores the rest verbatim
-                          ├─ normalizes + derives signals at read time
-                          └─ serves a read-only dashboard over the capture DB
+Claude Code ─┐                      ┌─HTTPS─▶ api.anthropic.com
+             ├─HTTP─▶ Orama proxy ──┤   (routed by wire dialect)
+Codex ───────┘             │        └─HTTPS─▶ api.openai.com
+                           │
+                           ├─ tees every request/response (streaming included)
+                           ├─ redacts auth headers, stores the rest verbatim
+                           ├─ normalizes + derives signals at read time
+                           └─ serves a read-only dashboard over the capture DB
 ```
 
 Each request→response exchange is stored as one SQLite row (raw SSE **and**
@@ -65,14 +69,18 @@ If your toolchain is managed by mise, prefix cargo commands with
 cargo run -- start
 ```
 
-This boots the proxy and prints an export snippet. Paste it into the shell that
-runs Claude Code:
+This boots the proxy and prints an export snippet. Paste the line for whichever
+agent you are running:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-export ANTHROPIC_AUTH_TOKEN=<your-anthropic-token>
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787       # Claude Code
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1       # Codex
+
 claude            # runs normally; every call is captured
 ```
+
+Your existing credentials are forwarded untouched — there is no token to
+configure, and auth headers are redacted before anything is written to disk.
 
 Then open the dashboard:
 
@@ -80,14 +88,61 @@ Then open the dashboard:
 http://127.0.0.1:8787/ui
 ```
 
+### Connecting without the shell
+
+The **Settings** surface (`/ui/#/settings`) shows what the proxy is bound to,
+which upstreams it forwards to, whether capture is actually running, and — the
+question the dashboard cannot otherwise answer — whether anything is pointed at
+it at all. An unconfigured proxy and an unused one both produce an empty
+dashboard, so connection state is read from the harness config files rather than
+inferred from an empty capture.
+
+From there, **Connect** wires up Claude Code or Codex by editing that harness's
+own config file:
+
+| Harness | File | Change |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` | sets `env.ANTHROPIC_BASE_URL` |
+| Codex | `~/.codex/config.toml` | sets `openai_base_url` |
+
+Codex gets a base-URL override rather than a custom `model_providers` entry on
+purpose. A custom provider has to declare where its credentials come from, and
+naming an `env_key` breaks the setup it was meant to trace: a Codex signed in
+through a ChatGPT plan has no API key to put in that variable and refuses to
+start. Overriding the base URL changes the destination and nothing else, so
+Codex keeps authenticating exactly as it did.
+
+Which URL it gets depends on how Codex authenticates, because the two modes use
+different backends — `chatgpt.com/backend-api/codex` for a subscription,
+`api.openai.com/v1` for an API key. The connector infers the mode from whether
+`OPENAI_API_KEY` is set and says which one it picked. Traffic finds its way back
+out by path prefix: `/backend-api/*` is relayed to the ChatGPT backend, `/v1/*`
+to the OpenAI one.
+
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honoured, so a relocated config
+directory is edited where the harness will actually read it. The original file
+is copied to `<name>.orama.bak` before the first edit, writes are atomic, and
+**Disconnect** restores the previous value rather than assuming a default — a
+base URL Orama did not set is never removed. Both harnesses read their config at
+startup, so restart the agent for the change to take effect.
+
+Anything else — the Anthropic and OpenAI SDKs, or an OpenAI-compatible host — is
+listed on the same page with the exact line to paste.
+
 ### Flags
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--port` | `8787` | Port the proxy listens on |
 | `--host` | `127.0.0.1` | Interface to bind |
-| `--upstream` | `https://api.anthropic.com` | Upstream API base URL |
+| `--upstream` | `https://api.anthropic.com` | Where Anthropic-dialect traffic goes |
+| `--upstream-openai` | `https://api.openai.com` | Where OpenAI-dialect traffic goes |
+| `--upstream-chatgpt` | `https://chatgpt.com` | Where `/backend-api/*` goes (Codex on a subscription) |
 | `--db` | `orama.sqlite` | SQLite capture database path |
+
+`--upstream-openai` is what makes an OpenAI-compatible provider traceable: the
+parsers key off the wire format, not the vendor, so pointing it at OpenRouter,
+Together, vLLM or Ollama captures that traffic the same way.
 
 Log verbosity follows `RUST_LOG` (default `info`); logs go to stderr.
 
@@ -101,7 +156,7 @@ captures are never modified.
 
 ## API
 
-Strictly read-only (GET only):
+Read-only over the capture database (GET only):
 
 | Endpoint | Returns |
 | --- | --- |
@@ -120,8 +175,17 @@ Strictly read-only (GET only):
 | `GET /api/ui/dashboard` | Aggregates backing the dashboard |
 | `GET /api/ui/alerts` | Alert feed (filterable, paginated) |
 | `GET /api/ui/events` | SSE stream of live updates |
+| `GET /api/v2/settings` | Proxy state, connector status, and setup snippets |
 | `GET /ui` | The dashboard SPA |
 | `GET /healthz` | Health probe |
+
+Two routes write, and they are the only ones. Neither touches the capture
+database — they edit a harness's own config file, as described above:
+
+| Endpoint | Effect |
+| --- | --- |
+| `POST /api/v2/connectors/:id/connect` | Point `claude-code` or `codex` at this proxy |
+| `POST /api/v2/connectors/:id/disconnect` | Restore what was there before |
 
 Every other path and method is transparently relayed upstream.
 

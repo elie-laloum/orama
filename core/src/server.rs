@@ -6,20 +6,33 @@ use std::net::SocketAddr;
 use axum::{routing::get, Router};
 use tokio::net::TcpListener;
 
-use crate::api::{self, ReadStore};
+use crate::api::{
+    self,
+    settings::{self, SettingsState},
+    ReadStore,
+};
 use crate::config::Config;
 use crate::relay::{relay, RelayState};
 use crate::store::StoreHandle;
+use crate::util::now_rfc3339;
 
-/// Build the axum router: the read-only UI/API, a health probe, and a catch-all
-/// relay to upstream.
+/// Build the axum router: the read-only UI/API, the settings surface, a health
+/// probe, and a catch-all relay to upstream.
 ///
 /// The UI/API and health probe are registered on dedicated paths; every other
 /// path/method falls through to the transparent relay. Pass a [`StoreHandle`]
 /// to enable capture; `None` gives a pure pass-through proxy.
 pub fn router(config: Config, store: Option<StoreHandle>) -> Router {
-    let state = RelayState::with_store(config.upstream.clone(), store);
+    let capturing = store.is_some();
+    let state = RelayState::with_store(&config, store);
     let read_store = ReadStore::new(config.db_path.clone());
+
+    let settings_state = SettingsState {
+        config: std::sync::Arc::new(config),
+        capturing,
+        started_at: now_rfc3339(),
+        store: read_store.clone(),
+    };
 
     // The relay/health routes carry RelayState; finalise that state before
     // merging with the already-stated read-only API/UI router.
@@ -30,6 +43,7 @@ pub fn router(config: Config, store: Option<StoreHandle>) -> Router {
 
     Router::new()
         .merge(api::routes(read_store))
+        .merge(settings::routes(settings_state))
         .merge(relay_router)
 }
 
@@ -52,8 +66,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let effective = Config {
         host: local.ip(),
         port: local.port(),
-        upstream: config.upstream.clone(),
-        db_path: config.db_path.clone(),
+        ..config.clone()
     };
 
     // Open the DB and spawn the background writer that owns the connection.
@@ -69,11 +82,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     };
 
     println!("Orama proxy listening on {local}");
-    println!("upstream: {}", effective.upstream);
+    println!("upstream (anthropic): {}", effective.upstream);
+    println!("upstream (openai):    {}", effective.upstream_openai);
     println!("capture db: {}", effective.db_path.display());
-    println!("\n# paste into the shell that runs Claude Code:");
+    println!("\n# paste into the shell that runs the agent:");
     println!("{}", effective.export_snippet());
-    println!("\n# open the UI at {}/ui", effective.public_base_url());
+    println!(
+        "\n# or configure Claude Code and Codex in one click: {}/ui/#/settings",
+        effective.public_base_url()
+    );
 
     let app = router(effective, store);
     axum::serve(listener, app).await?;

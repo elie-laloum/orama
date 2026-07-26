@@ -1,8 +1,15 @@
-//! Transparent catch-all relay to the upstream Anthropic API.
+//! Transparent catch-all relay to the upstream model provider.
+//!
+//! One listener serves both wire dialects. Which upstream a request goes to is
+//! decided per request by [`crate::parse::detect`] — the same function the
+//! derive layer uses to pick a parser, so a call can never be relayed as one
+//! dialect and read back as another.
 //!
 //! Best-effort tracing rule: relaying the request is the job; any internal
 //! tracing/capture error must surface on stderr only and never block or alter
-//! the client's request/response.
+//! the client's request/response. Choosing a destination host is not altering
+//! the exchange — the method, path, headers and body are still forwarded
+//! verbatim.
 
 use axum::{
     body::Body,
@@ -10,8 +17,11 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
+use serde_json::Value;
 use std::sync::Arc;
 
+use crate::config::Config;
+use crate::parse::model::Provider;
 use crate::store::{CallRecord, StoreHandle};
 use crate::util::{body_to_json, headers_to_json, now_rfc3339};
 
@@ -19,17 +29,26 @@ use crate::util::{body_to_json, headers_to_json, now_rfc3339};
 #[derive(Clone)]
 pub struct RelayState {
     pub client: reqwest::Client,
+    /// Where Anthropic-dialect traffic goes. Also the fallback for a request
+    /// whose dialect cannot be identified, which keeps an unrecognised route
+    /// behaving exactly as it did before OpenAI support existed.
     pub upstream: Arc<str>,
+    /// Where OpenAI-dialect traffic goes.
+    pub upstream_openai: Arc<str>,
+    /// Where `/backend-api/*` goes — Codex on a ChatGPT subscription, which is
+    /// a different backend from `api.openai.com` rather than a different path
+    /// on it.
+    pub upstream_chatgpt: Arc<str>,
     /// Optional capture sink. When `None`, the relay is pure pass-through.
     pub store: Option<StoreHandle>,
 }
 
 impl RelayState {
-    pub fn new(upstream: impl Into<String>) -> Self {
-        Self::with_store(upstream, None)
+    pub fn new(config: &Config) -> Self {
+        Self::with_store(config, None)
     }
 
-    pub fn with_store(upstream: impl Into<String>, store: Option<StoreHandle>) -> Self {
+    pub fn with_store(config: &Config, store: Option<StoreHandle>) -> Self {
         let client = reqwest::Client::builder()
             // Claude Code manages its own timeouts; don't impose our own on the
             // relay path or we could truncate long agentic calls.
@@ -37,8 +56,30 @@ impl RelayState {
             .expect("reqwest client builds with default config");
         Self {
             client,
-            upstream: Arc::from(upstream.into()),
+            upstream: Arc::from(config.upstream.as_str()),
+            upstream_openai: Arc::from(config.upstream_openai.as_str()),
+            upstream_chatgpt: Arc::from(config.upstream_chatgpt.as_str()),
             store,
+        }
+    }
+
+    /// The upstream for a captured request's headers and path.
+    ///
+    /// The path prefix wins over the dialect because it names a host, not a
+    /// format: `/backend-api/codex/responses` is the OpenAI wire format spoken
+    /// to ChatGPT's backend, and sending it to `api.openai.com` would 404 no
+    /// matter how correctly it parses.
+    ///
+    /// `Unknown` resolves to the Anthropic upstream rather than erroring: the
+    /// relay's contract is to forward everything, including the routes that
+    /// carry no dialect marker at all.
+    fn upstream_for(&self, headers: &Value, url: &str) -> &str {
+        if url.starts_with(crate::config::CHATGPT_PREFIX) {
+            return &self.upstream_chatgpt;
+        }
+        match crate::parse::detect(headers, url) {
+            Provider::OpenAi => &self.upstream_openai,
+            Provider::ClaudeCode | Provider::Unknown => &self.upstream,
         }
     }
 }
@@ -108,7 +149,17 @@ pub async fn relay(
         ..Default::default()
     };
 
-    match forward(&state, &method, &uri, &headers, body_bytes, record).await {
+    // Decided from the record we just built, so the dialect that picked the
+    // destination is exactly the one the parser will see on the way back out.
+    let upstream = state
+        .upstream_for(&record.request_headers, &record.url)
+        .to_owned();
+
+    match forward(
+        &state, upstream, &method, &uri, &headers, body_bytes, record,
+    )
+    .await
+    {
         Ok(response) => response,
         Err((err, mut record)) => {
             // Best-effort: never hide the failure from the operator, but return
@@ -141,13 +192,14 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
 /// each chunk to the client and stores when the stream ends.
 async fn forward(
     state: &RelayState,
+    upstream: String,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: Vec<u8>,
     mut record: CallRecord,
 ) -> Result<Response, (anyhow::Error, CallRecord)> {
-    let url = upstream_url(&state.upstream, uri);
+    let url = upstream_url(&upstream, uri);
 
     let mut req = state.client.request(method.clone(), &url);
 
@@ -309,6 +361,82 @@ mod tests {
         let uri: Uri = "/v1/models".parse().unwrap();
         let url = upstream_url("https://api.anthropic.com", &uri);
         assert_eq!(url, "https://api.anthropic.com/v1/models");
+    }
+
+    fn state() -> RelayState {
+        RelayState::new(&Config::default())
+    }
+
+    #[test]
+    fn anthropic_dialect_routes_to_the_anthropic_upstream() {
+        let state = state();
+        let headers = serde_json::json!({"x-app": "cli", "anthropic-version": "2023-06-01"});
+        assert_eq!(
+            state.upstream_for(&headers, "/v1/messages"),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn openai_dialect_routes_to_the_openai_upstream() {
+        let state = state();
+        // Codex speaks the Responses API; before per-dialect routing this went
+        // to api.anthropic.com and could never have been captured.
+        let headers = serde_json::json!({"user-agent": "codex_cli_rs/1.0"});
+        assert_eq!(
+            state.upstream_for(&headers, "/v1/responses"),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            state.upstream_for(&serde_json::json!({}), "/v1/chat/completions"),
+            "https://api.openai.com"
+        );
+    }
+
+    #[test]
+    fn the_chatgpt_prefix_outranks_the_dialect() {
+        // Codex on a subscription speaks the OpenAI wire format to a backend
+        // that is not api.openai.com. Routing on format alone would send it
+        // somewhere it does not exist.
+        let state = state();
+        assert_eq!(
+            state.upstream_for(
+                &serde_json::json!({"user-agent": "codex_exec/0.145.0"}),
+                "/backend-api/codex/responses"
+            ),
+            "https://chatgpt.com"
+        );
+    }
+
+    #[test]
+    fn a_versionless_responses_route_is_still_openai_dialect() {
+        // `/backend-api/codex/responses` carries no `/v1`, so matching on the
+        // versioned path would have stored it unparsed.
+        assert_eq!(
+            crate::parse::detect(&serde_json::json!({}), "/backend-api/codex/responses"),
+            Provider::OpenAi
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_request_still_goes_somewhere() {
+        // The relay forwards everything; a route with no dialect marker keeps
+        // its pre-OpenAI behaviour rather than failing.
+        let state = state();
+        assert_eq!(
+            state.upstream_for(&serde_json::json!({}), "/healthcheck"),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn an_openai_compatible_host_is_reachable_through_the_same_listener() {
+        let state =
+            RelayState::new(&Config::default().with_openai_upstream("https://openrouter.ai/api"));
+        assert_eq!(
+            state.upstream_for(&serde_json::json!({}), "/v1/chat/completions"),
+            "https://openrouter.ai/api"
+        );
     }
 
     #[test]

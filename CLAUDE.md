@@ -8,13 +8,18 @@ is shaped the way it is, and `README.md` for what it does.
 A local transparent HTTP proxy between a coding-agent CLI (Claude Code, Codex,
 opencode) and its model provider. It captures every round trip into SQLite,
 derives analytics from those captures, and serves a dashboard over them. No SDK,
-no MITM, no certificates — the client points `ANTHROPIC_BASE_URL` at it.
+no MITM, no certificates — the client points `ANTHROPIC_BASE_URL` or
+`OPENAI_BASE_URL` at it, or the Settings surface writes that config for it.
+
+One listener serves every dialect: `relay.rs` picks the upstream per request —
+`/backend-api/*` by path prefix, everything else via `parse::detect` — so Claude
+Code and Codex can be traced at once.
 
 ## Commands
 
 ```sh
 cargo build                       # workspace; build.rs embeds apps/web/dist if present
-cargo test                        # 83 tests: unit + spawn-on-port-0 integration
+cargo test                        # 104 tests: unit + spawn-on-port-0 integration
 cargo fmt --all && cargo clippy --all-targets
 
 cargo run -- start --db orama.sqlite          # relay + API + dashboard on :8787
@@ -33,14 +38,15 @@ The default database is `orama.sqlite`. Older captures may live in
 
 ```
 core/src/
-  relay.rs        catch-all proxy; tees SSE while forwarding bytes unchanged
+  relay.rs        catch-all proxy; routes by dialect, tees SSE unchanged
   store.rs        raw `calls` table, migrations, background writer
   reconstruct/    SSE → assembled response, per provider dialect
   parse/          provider parsers → one NormalizedCall shape
   derive/         normalized → materialized generations/tool_calls/sessions
   detect/         SQL detector catalogue → persisted alerts
   pricing.rs      model rates and cost attribution
-  api/            v2 read API + SSE; v1 is legacy
+  connect.rs      the only module that writes: harness config files
+  api/            v2 read API + SSE + settings; v1 is legacy
 apps/web/src/     Vite + Tailwind v4 + React dashboard
 ```
 
@@ -72,7 +78,18 @@ prompt" must use the sum.
 **The relay must never alter the exchange.** Capture failures go to stderr;
 tracing is best-effort and the client's bytes are forwarded unchanged. Derivation
 runs after the raw insert commits, inside `catch_unwind`, so a parser panic
-records a `derive_failures` row rather than losing the capture.
+records a `derive_failures` row rather than losing the capture. Choosing which
+upstream to forward to is not altering the exchange — but the choice must come
+from `parse::detect`, the same function that later picks the parser, or a call
+could be relayed as one dialect and read back as another.
+
+**`connect.rs` is the only writer outside `store.rs`, and it writes no data.**
+It edits files that belong to a harness, never anything Orama derives from. Its
+three rules are load-bearing: edits are surgical (one key, comments and ordering
+preserved), reversible (the replaced value is recorded, and a key we did not set
+is never removed), and atomic (temp file plus rename). A config that cannot be
+parsed is refused rather than rewritten — clobbering settings we never read
+would be worse than not connecting.
 
 **Derived tables store fingerprints, not content.** Request bodies are ~96% of
 the database because each call re-sends the whole conversation. Derived rows hold
@@ -114,7 +131,19 @@ than a few dozen rows there is almost certainly noise.
 ## Known gaps
 
 - No Codex or opencode captures exist, so the OpenAI parser is covered by
-  synthetic fixtures only.
+  synthetic fixtures only. Routing is verified end to end against stub
+  upstreams, and a live Codex 0.145 run confirmed the request path reaches
+  `chatgpt.com` — but that machine was logged out, so **no authenticated Codex
+  turn has ever been captured**. Whether Codex attaches its subscription token
+  to a custom base URL is untested.
+- Orama does not proxy WebSockets. Codex probes a WebSocket transport first,
+  gets a 405, retries five times and falls back to HTTP — costing a few seconds
+  on the first call of a session. A provider entry could suppress the probe with
+  `supports_websockets = false`, but only by taking over authentication too,
+  which is the trade the connector deliberately refuses.
+- The connectors are tested against sandboxed config directories
+  (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `ORAMA_HOME` are repointed at a temp
+  dir). Never run those tests without the sandbox — they write real files.
 - Subagent nesting is implemented but unexercised: no capture contains an `Agent`
   tool invocation. It degrades to a flat trace rather than guessing.
 - No frontend tests.

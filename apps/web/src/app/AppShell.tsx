@@ -10,6 +10,7 @@ import {
   ListTree,
   MessagesSquare,
   ScrollText,
+  SlidersHorizontal,
   Wrench,
 } from "lucide-react";
 
@@ -17,12 +18,14 @@ import { api, subscribe } from "@/api/client";
 import { cn } from "@/components/ui";
 import { num, percent } from "@/domain/format";
 
-const NAV: {
+type NavItem = {
   to: string;
   label: string;
   icon: typeof LayoutDashboard;
   end?: boolean;
-}[] = [
+};
+
+const NAV: NavItem[] = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/traces", label: "Traces", icon: ListTree },
   { to: "/generations", label: "Generations", icon: Activity },
@@ -32,6 +35,18 @@ const NAV: {
   { to: "/harness", label: "Harness", icon: ScrollText },
   { to: "/cost", label: "Cost", icon: DollarSign },
 ];
+
+const SETTINGS: NavItem = {
+  to: "/settings",
+  label: "Settings",
+  icon: SlidersHorizontal,
+};
+
+const linkClass = ({ isActive }: { isActive: boolean }) =>
+  cn(
+    "flex h-7 items-center gap-2 rounded-sm px-2 text-sm",
+    isActive ? "bg-raised text-fg" : "text-muted hover:bg-raised/60 hover:text-fg",
+  );
 
 export function AppShell() {
   const client = useQueryClient();
@@ -57,24 +72,23 @@ export function AppShell() {
         <ul className="flex-1 space-y-px p-1.5">
           {NAV.map(({ to, label, icon: Icon, end }) => (
             <li key={to}>
-              <NavLink
-                to={to}
-                end={end}
-                className={({ isActive }) =>
-                  cn(
-                    "flex h-7 items-center gap-2 rounded-sm px-2 text-sm",
-                    isActive
-                      ? "bg-raised text-fg"
-                      : "text-muted hover:bg-raised/60 hover:text-fg",
-                  )
-                }
-              >
+              <NavLink to={to} end={end} className={linkClass}>
                 <Icon size={14} aria-hidden />
                 {label}
               </NavLink>
             </li>
           ))}
         </ul>
+
+        {/* Pinned below the analytics surfaces: it configures the proxy rather
+            than reporting on it, and it is where a first-run user starts. */}
+        <div className="p-1.5">
+          <NavLink to={SETTINGS.to} className={linkClass}>
+            <SETTINGS.icon size={14} aria-hidden />
+            {SETTINGS.label}
+            <ConnectionDot />
+          </NavLink>
+        </div>
 
         <div className="space-y-1.5 border-t border-border px-3 py-2.5 text-2xs text-faint">
           <Counts meta={meta} />
@@ -95,6 +109,27 @@ export function AppShell() {
         <Outlet />
       </main>
     </div>
+  );
+}
+
+/**
+ * A quiet marker for "nothing is routed through this proxy".
+ *
+ * Worth surfacing in the nav because the failure it warns about is silent: an
+ * unconfigured proxy produces an empty dashboard, which reads as "no traffic
+ * yet" rather than "the harness never knew about you".
+ */
+function ConnectionDot() {
+  const { data } = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  if (!data || data.connectors.some((connector) => connector.connected)) {
+    return null;
+  }
+  return (
+    <span
+      title="No harness is pointed at this proxy"
+      className="ml-auto size-1.5 rounded-full bg-warn"
+      aria-hidden
+    />
   );
 }
 

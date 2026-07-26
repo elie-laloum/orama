@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use clap::{Parser, Subcommand};
 use orama_core::{
-    config::{DEFAULT_PORT, DEFAULT_UPSTREAM},
+    config::{DEFAULT_PORT, DEFAULT_UPSTREAM, DEFAULT_UPSTREAM_CHATGPT, DEFAULT_UPSTREAM_OPENAI},
     Config,
 };
 
@@ -34,6 +34,19 @@ enum Command {
         /// Upstream Anthropic-compatible API base URL.
         #[arg(long, default_value = DEFAULT_UPSTREAM)]
         upstream: String,
+
+        /// Upstream for OpenAI-dialect traffic — Codex, opencode, or any
+        /// OpenAI-compatible host such as OpenRouter or a local vLLM.
+        ///
+        /// One listener serves both dialects: the relay routes each request by
+        /// its wire format, so Claude Code and Codex can be traced at once.
+        #[arg(long, default_value = DEFAULT_UPSTREAM_OPENAI)]
+        upstream_openai: String,
+
+        /// Upstream for `/backend-api/*` — Codex signed in through a ChatGPT
+        /// subscription, which is a different backend from api.openai.com.
+        #[arg(long, default_value = DEFAULT_UPSTREAM_CHATGPT)]
+        upstream_chatgpt: String,
 
         /// Path to the SQLite capture database.
         #[arg(long, default_value = "orama.sqlite")]
@@ -70,9 +83,14 @@ async fn main() -> anyhow::Result<()> {
             port,
             host,
             upstream,
+            upstream_openai,
+            upstream_chatgpt,
             db,
         } => {
-            let config = Config::new(host, port, upstream).with_db_path(db);
+            let config = Config::new(host, port, upstream)
+                .with_openai_upstream(upstream_openai)
+                .with_chatgpt_upstream(upstream_chatgpt)
+                .with_db_path(db);
             orama_core::serve(config).await?;
         }
         Command::Derive { db, rebuild } => {

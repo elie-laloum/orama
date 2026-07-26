@@ -30,6 +30,7 @@ use crate::{
 };
 
 pub mod events;
+pub mod settings;
 pub mod v2;
 
 /// Read-only handle to the capture DB for the API/UI.

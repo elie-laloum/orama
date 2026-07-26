@@ -356,6 +356,78 @@ export interface CallContext {
   };
 }
 
+/* ── settings ─────────────────────────────────────────────────────────── */
+
+export interface ProxyState {
+  listening_on: string;
+  base_url: string;
+  openai_base_url: string;
+  upstream_anthropic: string;
+  upstream_openai: string;
+  /** Codex on a ChatGPT subscription: a different backend, not a different path. */
+  upstream_chatgpt: string;
+  db_path: string;
+  db_bytes: Nullable;
+  /** False when the database could not be opened: relaying, but not recording. */
+  capturing: boolean;
+  started_at: string;
+  /** Null means nothing has ever been captured, not "captured at time zero". */
+  last_capture_at: string | null;
+  parser_version: string;
+  pricing_version: string;
+  policy_version: string;
+}
+
+/** A harness Orama can configure by editing its own config file. */
+export interface Connector {
+  id: string;
+  label: string;
+  config_path: string;
+  config_exists: boolean;
+  /** Points at this proxy specifically, not merely at some proxy. */
+  connected: boolean;
+  /** Where it currently points; null means straight to the provider. */
+  base_url: string | null;
+  /** We wrote the current value, so disconnecting can restore what was there. */
+  managed: boolean;
+  effect: string;
+  /** A prerequisite the connector cannot meet for you. Shown before the click. */
+  caveat: string | null;
+  restart_required: boolean;
+  error: string | null;
+}
+
+export interface GuideSnippet {
+  language: string;
+  label: string;
+  code: string;
+}
+
+/** A client with no config file to write — instructions instead of a button. */
+export interface Guide {
+  id: string;
+  label: string;
+  summary: string;
+  env: { name: string; value: string }[];
+  snippets: GuideSnippet[];
+  note: string;
+}
+
+export interface Settings {
+  proxy: ProxyState;
+  connectors: Connector[];
+  guides: Guide[];
+}
+
+export interface ConnectOutcome {
+  harness: string;
+  config_path: string;
+  backup_path: string | null;
+  /** The config already said what we were about to write. */
+  already: boolean;
+  status: Connector;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -372,6 +444,29 @@ async function get<T>(path: string): Promise<T> {
   if (!response.ok) {
     // The API explains its rejections — an unknown filter names the accepted
     // set — so surface that rather than a bare status code.
+    let detail = response.statusText;
+    try {
+      detail = ((await response.json()) as { error?: string }).error ?? detail;
+    } catch {
+      /* non-JSON body; the status text stands */
+    }
+    throw new ApiError(detail, response.status);
+  }
+  return (await response.json()) as T;
+}
+
+/**
+ * The one place this client writes.
+ *
+ * Kept deliberately separate from `get`: everything else here reads the
+ * capture database, and these two routes edit a harness's own config file.
+ */
+async function post<T>(path: string): Promise<T> {
+  const response = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) {
     let detail = response.statusText;
     try {
       detail = ((await response.json()) as { error?: string }).error ?? detail;
@@ -457,6 +552,12 @@ export const api = {
 
   cost: (groupBy: string) =>
     get<{ buckets: CostBucket[] }>(`/cost${qs({ group_by: groupBy })}`),
+
+  settings: () => get<Settings>("/settings"),
+  connect: (id: string) =>
+    post<ConnectOutcome>(`/connectors/${encodeURIComponent(id)}/connect`),
+  disconnect: (id: string) =>
+    post<ConnectOutcome>(`/connectors/${encodeURIComponent(id)}/disconnect`),
 };
 
 /**
