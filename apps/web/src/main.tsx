@@ -12,6 +12,7 @@ import { Errors } from "@/features/Errors";
 import { Tools } from "@/features/Tools";
 import { Harness } from "@/features/Harness";
 import { Cost } from "@/features/Cost";
+import { Models } from "@/features/Models";
 import { Settings } from "@/features/Settings";
 import "@/styles/index.css";
 
@@ -32,6 +33,7 @@ const router = createHashRouter([
       { path: "tools", element: <Tools /> },
       { path: "harness", element: <Harness /> },
       { path: "cost", element: <Cost /> },
+      { path: "models", element: <Models /> },
       { path: "settings", element: <Settings /> },
     ],
   },

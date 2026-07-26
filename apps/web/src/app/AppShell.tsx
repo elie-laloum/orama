@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   Boxes,
   DollarSign,
+  Layers,
   LayoutDashboard,
   ListTree,
   MessagesSquare,
@@ -34,6 +35,7 @@ const NAV: NavItem[] = [
   { to: "/tools", label: "Tools", icon: Wrench },
   { to: "/harness", label: "Harness", icon: ScrollText },
   { to: "/cost", label: "Cost", icon: DollarSign },
+  { to: "/models", label: "Models", icon: Layers },
 ];
 
 const SETTINGS: NavItem = {

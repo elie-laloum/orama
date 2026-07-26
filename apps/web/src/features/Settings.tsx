@@ -69,6 +69,7 @@ function SettingsBody({ data }: { data: SettingsData }) {
     <>
       <Proxy proxy={data.proxy} />
       <Connectors connectors={data.connectors} proxy={data.proxy} />
+      <Catalog catalog={data.proxy.catalog} />
       <Guides guides={data.guides} />
     </>
   );
@@ -121,6 +122,101 @@ function Proxy({ proxy }: { proxy: ProxyState }) {
           value={`parser ${proxy.parser_version} · pricing ${proxy.pricing_version} · policy ${proxy.policy_version}`}
         />
       </dl>
+    </Panel>
+  );
+}
+
+/**
+ * Where the prices come from, and how to move them.
+ *
+ * Rates are not maintained in this repo — they are a cached copy of what
+ * models.dev publishes. That makes their age a fact worth showing: a stale
+ * catalogue prices calls at rates nobody is charging any more.
+ */
+function Catalog({ catalog }: { catalog: ProxyState["catalog"] }) {
+  const client = useQueryClient();
+  const [outcome, setOutcome] = React.useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: () => api.refreshCatalog(),
+    onSuccess: (result) => {
+      setOutcome(
+        result.changed
+          ? `Updated to ${result.catalog?.models ?? 0} models. Existing captures are being re-priced.`
+          : "Already current — the published rates have not changed.",
+      );
+      client.invalidateQueries();
+    },
+    onError: () => setOutcome(null),
+  });
+
+  return (
+    <Panel
+      title="Model catalogue"
+      action={
+        catalog?.source === "embedded" ? (
+          <Pill tone="warn" title="Nothing fresher could be loaded">
+            bundled copy
+          </Pill>
+        ) : catalog ? (
+          <Pill tone="ok">{catalog.source}</Pill>
+        ) : (
+          <Pill tone="error" title="No rates are loaded, so nothing can be priced">
+            unavailable
+          </Pill>
+        )
+      }
+    >
+      {!catalog && (
+        <p className="flex items-start gap-2 border-b border-border bg-error/5 px-3 py-2 text-2xs text-error">
+          <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden />
+          No catalogue could be loaded, so no call can be priced. Every cost on
+          every screen will read {UNKNOWN} until this is fixed.
+        </p>
+      )}
+      <dl className="grid grid-cols-1 gap-x-6 gap-y-px p-3 sm:grid-cols-2">
+        <Field label="Source" value="models.dev" mono />
+        <Field label="Models" value={catalog ? compact(catalog.models) : UNKNOWN} />
+        <Field label="Providers" value={catalog ? compact(catalog.providers) : UNKNOWN} />
+        <Field label="Snapshot" value={catalog ? catalog.digest.slice(0, 12) : UNKNOWN} mono />
+        <Field
+          label="Downloaded"
+          value={catalog ? ago(catalog.fetched_at) : UNKNOWN}
+          title={catalog ? clock(catalog.fetched_at) : undefined}
+        />
+        <Field
+          label="Last checked"
+          value={catalog ? ago(catalog.checked_at) : UNKNOWN}
+          title={catalog ? clock(catalog.checked_at) : undefined}
+        />
+      </dl>
+      <div className="flex items-center gap-3 border-t border-border px-3 py-2">
+        <button
+          type="button"
+          disabled={mutation.isPending}
+          onClick={() => {
+            setOutcome(null);
+            mutation.mutate();
+          }}
+          className="flex h-7 items-center gap-1.5 rounded-sm border border-border px-2 text-xs text-fg hover:bg-raised disabled:opacity-50"
+        >
+          {mutation.isPending ? (
+            <Loader2 size={12} className="animate-spin" aria-hidden />
+          ) : (
+            <RotateCw size={12} aria-hidden />
+          )}
+          Check for new rates
+        </button>
+        {mutation.error ? (
+          <span className="text-2xs text-error">{String(mutation.error)}</span>
+        ) : outcome ? (
+          <span className="text-2xs text-ok">{outcome}</span>
+        ) : (
+          <span className="text-2xs text-faint">
+            Checked automatically once a day.
+          </span>
+        )}
+      </div>
     </Panel>
   );
 }

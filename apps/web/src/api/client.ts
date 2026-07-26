@@ -24,6 +24,69 @@ export interface Meta {
   parser_version: string;
   pricing_version: string;
   policy_version: string;
+  /** Null means no catalogue loaded, so nothing can be priced at all. */
+  catalog: CatalogMeta | null;
+}
+
+/* ── model catalogue ──────────────────────────────────────────────────── */
+
+/** Which snapshot of the published rates is in force. */
+export interface CatalogMeta {
+  digest: string;
+  /** Where it came from: bundled with the binary, cached locally, or fetched. */
+  source: "embedded" | "cached" | "network";
+  fetched_at: string;
+  /** When it was last confirmed current — a 304 moves this, not `fetched_at`. */
+  checked_at: string;
+  providers: number;
+  models: number;
+}
+
+/**
+ * A model this capture used, joined to what the catalogue knows about it.
+ *
+ * Everything from `name` down is absent when the catalogue has no entry: the
+ * usage is still real, only the description of the model is missing.
+ */
+export interface ModelUsage {
+  provider: string;
+  model: string;
+  generations: number;
+  input_tokens: Nullable;
+  output_tokens: Nullable;
+  cache_read_tokens: Nullable;
+  cache_creation_tokens: Nullable;
+  cost_total_usd: Nullable;
+  /** Input + cache read + cache write — the whole prompt, not the remainder. */
+  peak_context_tokens: Nullable;
+  first_seen: string;
+  last_seen: string;
+  priced_share: Nullable;
+  in_catalog: boolean;
+  name?: string | null;
+  family?: string | null;
+  description?: string | null;
+  status?: string | null;
+  release_date?: string | null;
+  knowledge?: string | null;
+  context_limit?: Nullable;
+  output_limit?: Nullable;
+  rate_input?: Nullable;
+  rate_output?: Nullable;
+  rate_cache_read?: Nullable;
+  rate_cache_write?: Nullable;
+  /** The model charges more above a context size. */
+  tiered?: boolean;
+  reasoning?: boolean;
+  tool_call?: boolean;
+  structured_output?: boolean;
+  attachment?: boolean;
+  input_modalities?: string[];
+}
+
+export interface CatalogRefresh {
+  changed: boolean;
+  catalog: CatalogMeta | null;
 }
 
 export interface Generation {
@@ -376,6 +439,8 @@ export interface ProxyState {
   parser_version: string;
   pricing_version: string;
   policy_version: string;
+  /** Null means no catalogue loaded, so nothing can be priced at all. */
+  catalog: CatalogMeta | null;
 }
 
 /** A harness Orama can configure by editing its own config file. */
@@ -553,11 +618,14 @@ export const api = {
   cost: (groupBy: string) =>
     get<{ buckets: CostBucket[] }>(`/cost${qs({ group_by: groupBy })}`),
 
+  models: () => get<{ catalog: CatalogMeta | null; models: ModelUsage[] }>("/models"),
+
   settings: () => get<Settings>("/settings"),
   connect: (id: string) =>
     post<ConnectOutcome>(`/connectors/${encodeURIComponent(id)}/connect`),
   disconnect: (id: string) =>
     post<ConnectOutcome>(`/connectors/${encodeURIComponent(id)}/disconnect`),
+  refreshCatalog: () => post<CatalogRefresh>("/catalog/refresh"),
 };
 
 /**
