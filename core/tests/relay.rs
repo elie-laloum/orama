@@ -12,8 +12,8 @@ use axum::{
     routing::any,
     Router,
 };
+use orama_core::{server::router, Config};
 use tokio::net::TcpListener;
-use tracer_core::{server::router, Config};
 
 #[derive(Default, Clone)]
 struct Captured {

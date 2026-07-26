@@ -221,7 +221,7 @@ pub fn record_failure(conn: &Connection, call_id: i64, stage: &str, error: &str,
         ],
     );
     if let Err(err) = result {
-        eprintln!("tracer: could not record derive failure for call {call_id}: {err}");
+        eprintln!("orama: could not record derive failure for call {call_id}: {err}");
     }
 }
 
@@ -258,13 +258,13 @@ pub fn derive_live(conn: &Connection, call: &StoredCall) {
         return;
     };
     if let Err(err) = super::trace::assemble_session(conn, &session) {
-        eprintln!("tracer: failed to assemble session {session}: {err}");
+        eprintln!("orama: failed to assemble session {session}: {err}");
     }
     if let Err(err) = rollup_sessions(conn, Some(&session)) {
-        eprintln!("tracer: failed to refresh session rollup: {err}");
+        eprintln!("orama: failed to refresh session rollup: {err}");
     }
     if let Err(err) = crate::detect::evaluate(conn, &crate::detect::SignalPolicy::default()) {
-        eprintln!("tracer: failed to evaluate detectors: {err}");
+        eprintln!("orama: failed to evaluate detectors: {err}");
     }
 }
 
@@ -322,7 +322,7 @@ pub fn backfill(conn: &Connection) -> Result<BackfillReport> {
 
 /// Open a capture database, migrate it, and bring the derived layer up to date.
 ///
-/// This is the entry point for the `tracer derive` command: it owns the
+/// This is the entry point for the `orama derive` command: it owns the
 /// connection so callers never need a SQLite dependency of their own.
 pub fn run_backfill(
     db_path: impl AsRef<std::path::Path>,

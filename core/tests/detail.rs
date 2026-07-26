@@ -5,13 +5,13 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::Router;
-use serde_json::json;
-use tokio::net::TcpListener;
-use tracer_core::{
+use orama_core::{
     server::router,
     store::{insert, CallRecord, REDACTED},
     Config,
 };
+use serde_json::json;
+use tokio::net::TcpListener;
 
 async fn spawn(app: Router) -> SocketAddr {
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -34,13 +34,13 @@ async fn get_json(url: String) -> (reqwest::StatusCode, serde_json::Value) {
 
 #[tokio::test]
 async fn detail_returns_full_exchange_and_redacts_auth() {
-    let db = std::env::temp_dir().join(format!("tracer-detail-{}.sqlite", std::process::id()));
+    let db = std::env::temp_dir().join(format!("orama-detail-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&db);
 
     // Seed one streaming call with system/messages/tools + reconstruction.
     let id = {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        tracer_core::store::apply_schema(&conn).unwrap();
+        orama_core::store::apply_schema(&conn).unwrap();
         insert(
             &conn,
             &CallRecord {

@@ -11,9 +11,9 @@ use axum::{
     Router,
 };
 use futures::StreamExt;
+use orama_core::{server::router, store::list_calls, Config};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
-use tracer_core::{server::router, store::list_calls, Config};
 
 /// Mock upstream that emits three SSE events with a delay between each, so a
 /// correctly-teeing proxy delivers them incrementally rather than all at once.
@@ -53,7 +53,7 @@ async fn spawn(app: Router) -> SocketAddr {
 async fn streaming_is_teed_live_and_persisted() {
     let upstream_addr = spawn(Router::new().fallback(any(sse_upstream))).await;
 
-    let db = std::env::temp_dir().join(format!("tracer-stream-{}.sqlite", std::process::id()));
+    let db = std::env::temp_dir().join(format!("orama-stream-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&db);
 
     let cfg = Config::new(
@@ -62,7 +62,7 @@ async fn streaming_is_teed_live_and_persisted() {
         format!("http://{upstream_addr}"),
     )
     .with_db_path(&db);
-    let store = tracer_core::store::spawn_writer(&db).unwrap();
+    let store = orama_core::store::spawn_writer(&db).unwrap();
     let proxy_addr = spawn(router(cfg, Some(store))).await;
 
     // Consume the stream through the proxy, timestamping chunk arrivals.

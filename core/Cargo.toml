@@ -1,12 +1,12 @@
 [package]
-name = "tracer-core"
+name = "orama-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 build = "build.rs"
 
 [lib]
-name = "tracer_core"
+name = "orama_core"
 path = "src/lib.rs"
 
 [dependencies]

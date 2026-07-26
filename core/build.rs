@@ -18,7 +18,7 @@ const ASSETS: &[(&str, &str)] = &[("index.html", "ui_index.html"), ("main.js", "
 
 const PLACEHOLDER_HTML: &str = r#"<!doctype html>
 <meta charset="utf-8">
-<title>tracer — UI not built</title>
+<title>Orama — UI not built</title>
 <body style="font:14px system-ui;margin:3rem auto;max-width:40rem;line-height:1.6">
 <h1>UI bundle not built</h1>
 <p>The dashboard assets were not present when this binary was compiled.</p>
@@ -29,7 +29,7 @@ cargo build</pre>
 "#;
 
 const PLACEHOLDER_JS: &str =
-    "console.warn('tracer: UI bundle not built; run `npm run build` in apps/web');\n";
+    "console.warn('orama: UI bundle not built; run `npm run build` in apps/web');\n";
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
@@ -48,7 +48,7 @@ fn main() {
                 _ => PLACEHOLDER_JS,
             };
             println!(
-                "cargo:warning=tracer: {} not found; embedding a placeholder instead",
+                "cargo:warning=orama: {} not found; embedding a placeholder instead",
                 source.display()
             );
             placeholder.as_bytes().to_vec()

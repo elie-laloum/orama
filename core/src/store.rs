@@ -70,7 +70,7 @@ impl StoreHandle {
     /// stderr and dropped, never propagated to the client.
     pub fn record(&self, record: CallRecord) {
         if let Err(err) = self.tx.send(record) {
-            eprintln!("tracer: failed to enqueue call record: {err}");
+            eprintln!("orama: failed to enqueue call record: {err}");
         }
     }
 }
@@ -96,7 +96,7 @@ pub fn spawn_writer(path: impl AsRef<Path>) -> anyhow::Result<StoreHandle> {
                     let stored = StoredCall { id, record };
                     crate::derive::write::derive_live(&conn, &stored);
                 }
-                Err(err) => eprintln!("tracer: failed to persist call record: {err}"),
+                Err(err) => eprintln!("orama: failed to persist call record: {err}"),
             }
         }
     });

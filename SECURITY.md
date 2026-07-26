@@ -95,9 +95,9 @@ belongs to the user running it.
 
 - Keep the default `--host 127.0.0.1` unless you fully control the network.
 - Store the capture database outside any directory you sync, back up, or commit
-  (`--db /path/outside/the/repo/tracer.sqlite`).
+  (`--db /path/outside/the/repo/orama.sqlite`).
 - Restrict the file yourself if others share the machine: `chmod 600
-  tracer.sqlite`.
+  orama.sqlite`.
 - Delete captures you no longer need. There is no retention policy — the
   database grows until you remove it.
 - Redact before sharing. A capture pasted into an issue may contain your source

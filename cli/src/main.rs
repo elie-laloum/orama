@@ -1,18 +1,18 @@
-//! `tracer` — CLI wrapper around `tracer-core`.
+//! `orama` — CLI wrapper around `orama-core`.
 
 use std::net::{IpAddr, Ipv4Addr};
 
 use clap::{Parser, Subcommand};
-use tracer_core::{
+use orama_core::{
     config::{DEFAULT_PORT, DEFAULT_UPSTREAM},
     Config,
 };
 
 #[derive(Parser)]
 #[command(
-    name = "tracer",
+    name = "orama",
     version,
-    about = "Transparent tracer for Claude Code API traffic"
+    about = "Transparent tracing proxy for Claude Code API traffic"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,7 +36,7 @@ enum Command {
         upstream: String,
 
         /// Path to the SQLite capture database.
-        #[arg(long, default_value = "tracer.sqlite")]
+        #[arg(long, default_value = "orama.sqlite")]
         db: std::path::PathBuf,
     },
 
@@ -46,7 +46,7 @@ enum Command {
     /// `--rebuild` to force a full re-derivation.
     Derive {
         /// Path to the SQLite capture database.
-        #[arg(long, default_value = "tracer.sqlite")]
+        #[arg(long, default_value = "orama.sqlite")]
         db: std::path::PathBuf,
 
         /// Discard existing derived rows before deriving.
@@ -73,18 +73,18 @@ async fn main() -> anyhow::Result<()> {
             db,
         } => {
             let config = Config::new(host, port, upstream).with_db_path(db);
-            tracer_core::serve(config).await?;
+            orama_core::serve(config).await?;
         }
         Command::Derive { db, rebuild } => {
-            let report = tracer_core::derive::write::run_backfill(&db, rebuild)?;
+            let report = orama_core::derive::write::run_backfill(&db, rebuild)?;
             println!(
                 "derived {} call(s), {} failed, parser {}",
                 report.derived,
                 report.failed,
-                tracer_core::derive::PARSER_VERSION
+                orama_core::derive::PARSER_VERSION
             );
             if report.failed > 0 {
-                eprintln!("tracer: see the derive_failures table for details");
+                eprintln!("orama: see the derive_failures table for details");
             }
         }
     }

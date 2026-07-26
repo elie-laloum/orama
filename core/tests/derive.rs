@@ -1,18 +1,16 @@
 //! The derived layer: materialization, idempotency, and the fields that the
 //! read-time parser never extracted.
 
-use serde_json::json;
-use tracer_core::{
+use orama_core::{
     derive::write::{backfill, clear_derived, BackfillReport},
     store::{apply_schema, insert, CallRecord},
 };
+use serde_json::json;
 
 /// A fresh temp database, named per test so parallel runs cannot collide.
 fn temp_db(name: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "tracer-derive-{name}-{}.sqlite",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("orama-derive-{name}-{}.sqlite", std::process::id()));
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }

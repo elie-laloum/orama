@@ -328,7 +328,7 @@ async fn detail_handler(State(store): State<ReadStore>, Path(id): Path<i64>) -> 
 
 fn db_error(err: rusqlite::Error) -> Response {
     // Read errors are non-fatal for the process; report cleanly to the client.
-    eprintln!("tracer: read API db error: {err}");
+    eprintln!("orama: read API db error: {err}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": err.to_string() })),

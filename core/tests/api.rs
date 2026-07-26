@@ -5,13 +5,13 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::Router;
-use serde_json::json;
-use tokio::net::TcpListener;
-use tracer_core::{
+use orama_core::{
     server::router,
     store::{insert, CallRecord},
     Config,
 };
+use serde_json::json;
+use tokio::net::TcpListener;
 
 async fn spawn(app: Router) -> SocketAddr {
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -26,7 +26,7 @@ async fn spawn(app: Router) -> SocketAddr {
 
 fn seed(db: &std::path::Path) {
     let conn = rusqlite::Connection::open(db).unwrap();
-    tracer_core::store::apply_schema(&conn).unwrap();
+    orama_core::store::apply_schema(&conn).unwrap();
     // Two calls; the second is a streaming error call.
     insert(
         &conn,
@@ -60,7 +60,7 @@ fn seed(db: &std::path::Path) {
 
 #[tokio::test]
 async fn api_lists_calls_most_recent_first_and_serves_ui() {
-    let db = std::env::temp_dir().join(format!("tracer-api-{}.sqlite", std::process::id()));
+    let db = std::env::temp_dir().join(format!("orama-api-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&db);
     seed(&db);
 
@@ -101,7 +101,7 @@ async fn api_lists_calls_most_recent_first_and_serves_ui() {
         .to_string();
     assert!(ct.contains("text/html"));
     let html = ui.text().await.unwrap();
-    assert!(html.contains("tracer"));
+    assert!(html.to_lowercase().contains("orama"));
     assert!(html.contains("/api/calls"));
 
     // Read-only: POST to the API is not allowed.

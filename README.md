@@ -87,9 +87,13 @@ http://127.0.0.1:8787/ui
 | `--port` | `8787` | Port the proxy listens on |
 | `--host` | `127.0.0.1` | Interface to bind |
 | `--upstream` | `https://api.anthropic.com` | Upstream API base URL |
-| `--db` | `tracer.sqlite` | SQLite capture database path |
+| `--db` | `orama.sqlite` | SQLite capture database path |
 
 Log verbosity follows `RUST_LOG` (default `info`); logs go to stderr.
+
+The binary also exposes `orama derive`, which rebuilds the derived analytics
+tables from the raw captures (`--rebuild` forces a full re-derivation). Raw
+captures are never modified.
 
 > **Binding to a non-loopback `--host` exposes your captured traffic — including
 > full prompts — to anyone who can reach that port. There is no authentication
@@ -129,8 +133,7 @@ Cargo workspace plus a frontend app:
 - `core/` — the library: config, relay, streaming tee, SSE reconstruction,
   SQLite store, provider parsing/normalization, signals and diagnostics,
   read-only API. A future Tauri shell can depend on this directly.
-- `cli/` — thin CLI binary. The crates and the shipped binary are still named
-  `tracer-core` / `tracer`; only the project is called Orama.
+- `cli/` — thin `orama` binary.
 - `apps/web/` — React + TypeScript dashboard (Rspack), embedded into the binary
   at build time.
 

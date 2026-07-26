@@ -3,13 +3,13 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::Router;
-use serde_json::json;
-use tokio::net::TcpListener;
-use tracer_core::{
+use orama_core::{
     server::router,
     store::{insert, CallRecord},
     Config,
 };
+use serde_json::json;
+use tokio::net::TcpListener;
 
 async fn spawn(app: Router) -> SocketAddr {
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -29,11 +29,11 @@ async fn get_json(url: String) -> serde_json::Value {
 
 #[tokio::test]
 async fn derived_endpoints_normalize_and_group_claude_code_calls() {
-    let db = std::env::temp_dir().join(format!("tracer-structured-{}.sqlite", std::process::id()));
+    let db = std::env::temp_dir().join(format!("orama-structured-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&db);
     let id = {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        tracer_core::store::apply_schema(&conn).unwrap();
+        orama_core::store::apply_schema(&conn).unwrap();
         insert(&conn, &CallRecord {
             timestamp_start: "2026-07-25T00:00:00Z".into(), timestamp_first_chunk: Some("2026-07-25T00:00:00.100Z".into()), timestamp_end: Some("2026-07-25T00:00:01Z".into()), method: "POST".into(), url: "/v1/messages".into(),
             request_headers: json!({"x-app":"cli", "x-claude-code-session-id":"session-a"}),
@@ -82,10 +82,10 @@ async fn derived_endpoints_normalize_and_group_claude_code_calls() {
 
 #[tokio::test]
 async fn dashboard_uses_reconstructed_usage_for_exact_token_totals() {
-    let db = std::env::temp_dir().join(format!("tracer-dashboard-{}.sqlite", std::process::id()));
+    let db = std::env::temp_dir().join(format!("orama-dashboard-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&db);
     let conn = rusqlite::Connection::open(&db).unwrap();
-    tracer_core::store::apply_schema(&conn).unwrap();
+    orama_core::store::apply_schema(&conn).unwrap();
     insert(&conn, &CallRecord {
         timestamp_start: "2026-07-25T00:00:00Z".into(),
         request_headers: json!({"x-app":"cli", "x-claude-code-session-id":"session-a"}),

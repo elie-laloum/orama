@@ -61,14 +61,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         Ok(handle) => Some(handle),
         Err(err) => {
             eprintln!(
-                "tracer: could not open database at {}: {err} — running without capture",
+                "orama: could not open database at {}: {err} — running without capture",
                 effective.db_path.display()
             );
             None
         }
     };
 
-    println!("tracer proxy listening on {local}");
+    println!("Orama proxy listening on {local}");
     println!("upstream: {}", effective.upstream);
     println!("capture db: {}", effective.db_path.display());
     println!("\n# paste into the shell that runs Claude Code:");

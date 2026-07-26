@@ -1,15 +1,15 @@
 [package]
-name = "tracer-cli"
+name = "orama-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "tracer"
+name = "orama"
 path = "src/main.rs"
 
 [dependencies]
-tracer-core = { path = "../core" }
+orama-core = { path = "../core" }
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

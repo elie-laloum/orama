@@ -90,8 +90,8 @@ pub async fn relay(
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b.to_vec(),
         Err(err) => {
-            eprintln!("tracer: failed to read request body: {err}");
-            return (StatusCode::BAD_GATEWAY, "tracer: bad request body").into_response();
+            eprintln!("orama: failed to read request body: {err}");
+            return (StatusCode::BAD_GATEWAY, "orama: bad request body").into_response();
         }
     };
 
@@ -113,13 +113,13 @@ pub async fn relay(
         Err((err, mut record)) => {
             // Best-effort: never hide the failure from the operator, but return
             // a clean gateway error to the client rather than panicking.
-            eprintln!("tracer: relay to upstream failed: {err}");
+            eprintln!("orama: relay to upstream failed: {err}");
             record.timestamp_end = Some(now_rfc3339());
             record.error = Some(format!("relay failed: {err}"));
             if let Some(store) = &state.store {
                 store.record(record);
             }
-            (StatusCode::BAD_GATEWAY, "tracer: upstream relay failed").into_response()
+            (StatusCode::BAD_GATEWAY, "orama: upstream relay failed").into_response()
         }
     }
 }
@@ -253,7 +253,7 @@ fn stream_teeing_response(
                 Some(Err(err)) => {
                     // A mid-stream upstream error: surface it, record it, and
                     // stop. The client stream ends here rather than hanging.
-                    eprintln!("tracer: upstream stream error: {err}");
+                    eprintln!("orama: upstream stream error: {err}");
                     record.error = Some(format!("stream error: {err}"));
                     break;
                 }

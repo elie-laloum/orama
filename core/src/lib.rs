@@ -1,4 +1,4 @@
-//! tracer-core — transparent interception proxy for Claude Code API traffic.
+//! orama-core — transparent interception proxy for Claude Code API traffic.
 //!
 //! This crate holds the reusable logic (config, server, relay, storage) so a
 //! later Tauri desktop app can depend on it directly. The `cli` crate is a thin

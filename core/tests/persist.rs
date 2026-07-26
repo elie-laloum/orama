@@ -5,12 +5,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use axum::{http::StatusCode, response::IntoResponse, routing::any, Router};
-use tokio::net::TcpListener;
-use tracer_core::{
+use orama_core::{
     server::router,
     store::{list_calls, StoreHandle, REDACTED},
     Config,
 };
+use tokio::net::TcpListener;
 
 async fn mock_upstream() -> impl IntoResponse {
     (
@@ -38,7 +38,7 @@ async fn roundtrip_is_persisted_with_redacted_auth() {
 
     // Temp DB.
     let dir = std::env::temp_dir();
-    let db = dir.join(format!("tracer-test-{}.sqlite", std::process::id()));
+    let db = dir.join(format!("orama-test-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&db);
 
     let cfg = Config::new(
@@ -48,7 +48,7 @@ async fn roundtrip_is_persisted_with_redacted_auth() {
     )
     .with_db_path(&db);
 
-    let store: StoreHandle = tracer_core::store::spawn_writer(&db).unwrap();
+    let store: StoreHandle = orama_core::store::spawn_writer(&db).unwrap();
     let proxy_addr = spawn(router(cfg.clone(), Some(store))).await;
 
     // Fire a request through the proxy.

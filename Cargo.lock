@@ -978,6 +978,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "orama-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "orama-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "orama-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "blake3",
+ "bytes",
+ "futures",
+ "http",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1677,39 +1710,6 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
-
-[[package]]
-name = "tracer-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "tokio",
- "tracer-core",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tracer-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "axum",
- "blake3",
- "bytes",
- "futures",
- "http",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "tracing"

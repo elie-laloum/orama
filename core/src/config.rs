@@ -1,4 +1,4 @@
-//! Runtime configuration for the tracer proxy.
+//! Runtime configuration for the Orama proxy.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
 pub const DEFAULT_PORT: u16 = 8787;
 
 /// Default SQLite database filename.
-pub const DEFAULT_DB: &str = "tracer.sqlite";
+pub const DEFAULT_DB: &str = "orama.sqlite";
 
 /// Configuration for a running proxy instance.
 #[derive(Debug, Clone)]
