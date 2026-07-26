@@ -91,6 +91,16 @@ impl Config {
         self
     }
 
+    /// Override where Anthropic-dialect traffic is relayed (builder style).
+    ///
+    /// The sibling of [`Config::new`] for callers that start from
+    /// [`Config::default`] and only want to move one upstream — a windowed
+    /// process has no argv to build a config from.
+    pub fn with_upstream(mut self, upstream: impl Into<String>) -> Self {
+        self.upstream = normalize(upstream);
+        self
+    }
+
     /// Override where OpenAI-dialect traffic is relayed (builder style).
     pub fn with_openai_upstream(mut self, upstream: impl Into<String>) -> Self {
         self.upstream_openai = normalize(upstream);

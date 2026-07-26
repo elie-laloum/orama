@@ -55,29 +55,69 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Bind and serve the proxy until the process is terminated.
+/// A bound-but-not-yet-serving proxy.
 ///
-/// Prints the export snippet to stdout on startup (touches no files).
-pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let addr = SocketAddr::new(config.host, config.port);
-    let listener = TcpListener::bind(addr).await?;
+/// Exists because a caller can need the port before any traffic flows. The
+/// desktop shell is the case that forced it: it has to put a URL in a window,
+/// and printing the port to a stdout nobody is reading is no help. Binding is
+/// also the only way to learn that the port is already taken, which the shell
+/// reports rather than dying silently behind a blank window.
+pub struct Bound {
+    listener: TcpListener,
+    /// The configuration re-derived against the address actually bound, so a
+    /// requested port of 0 reads back as the port the OS chose.
+    config: Config,
+    store: Option<StoreHandle>,
+}
+
+impl Bound {
+    /// The address the proxy is listening on.
+    pub fn addr(&self) -> SocketAddr {
+        SocketAddr::new(self.config.host, self.config.port)
+    }
+
+    /// The configuration as bound — not as requested.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Whether captures are being recorded. False when the database could not
+    /// be opened: the proxy still relays, and the UI must not pretend
+    /// otherwise.
+    pub fn capturing(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Serve until the process is terminated.
+    pub async fn run(self) -> anyhow::Result<()> {
+        let app = router(self.config, self.store);
+        axum::serve(self.listener, app).await?;
+        Ok(())
+    }
+}
+
+/// Bind the proxy and open the capture database, without serving yet.
+///
+/// Failure to open the database is not failure to bind: relaying traffic is
+/// the job that cannot be dropped, so capture degrades to off and the caller
+/// learns which happened from [`Bound::capturing`].
+pub async fn bind(config: Config) -> anyhow::Result<Bound> {
+    let listener = TcpListener::bind(SocketAddr::new(config.host, config.port)).await?;
     let local = listener.local_addr()?;
 
-    // Re-derive config against the actually-bound address (in case port 0 was
-    // requested) so the printed snippet is correct.
-    let effective = Config {
+    let config = Config {
         host: local.ip(),
         port: local.port(),
-        ..config.clone()
+        ..config
     };
 
     // Open the DB and spawn the background writer that owns the connection.
-    let store = match crate::store::spawn_writer(&effective.db_path) {
+    let store = match crate::store::spawn_writer(&config.db_path) {
         Ok(handle) => Some(handle),
         Err(err) => {
             eprintln!(
                 "orama: could not open database at {}: {err} — running without capture",
-                effective.db_path.display()
+                config.db_path.display()
             );
             None
         }
@@ -88,11 +128,25 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // proxy can relay traffic, and startup must not wait on it. A snapshot is
     // already in force by now, loaded offline by `spawn_writer`.
     if let Some(handle) = store.clone() {
-        let db_path = effective.db_path.clone();
+        let db_path = config.db_path.clone();
         crate::catalog::fetch::spawn_refresh(db_path, move || handle.reprice());
     }
 
-    println!("Orama proxy listening on {local}");
+    Ok(Bound {
+        listener,
+        config,
+        store,
+    })
+}
+
+/// Bind and serve the proxy until the process is terminated.
+///
+/// Prints the export snippet to stdout on startup (touches no files).
+pub async fn serve(config: Config) -> anyhow::Result<()> {
+    let bound = bind(config).await?;
+    let effective = bound.config();
+
+    println!("Orama proxy listening on {}", bound.addr());
     println!("upstream (anthropic): {}", effective.upstream);
     println!("upstream (openai):    {}", effective.upstream_openai);
     println!("capture db: {}", effective.db_path.display());
@@ -103,9 +157,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         effective.public_base_url()
     );
 
-    let app = router(effective, store);
-    axum::serve(listener, app).await?;
-    Ok(())
+    bound.run().await
 }
 
 #[cfg(test)]

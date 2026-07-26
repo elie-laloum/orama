@@ -1,0 +1,148 @@
+name: desktop
+
+# Installers for the three desktop platforms. Neither macOS nor Windows can be
+# cross-compiled from a Linux checkout — each needs its own webview toolchain —
+# so the matrix is the only place a full set of artifacts exists.
+#
+# Runs on a tag, and on demand. Not on every push: a three-OS release build is
+# minutes of runner time that a source change does not need, and `cargo test`
+# already guards the code. `pull_request` gets a compile-only Linux job so a
+# broken shell is still caught before it is tagged.
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap gate on pull requests: does the shell still build, and do its tests
+  # still pass? No bundling, no signing, one platform.
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux webview dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential curl wget file libxdo-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      # The dashboard is embedded into the binary by core/build.rs, so it has
+      # to exist before the Rust build, not after.
+      - name: Build the dashboard
+        run: npm --prefix apps/web ci && npm --prefix apps/web run build
+
+      - name: Check the desktop shell
+        # --no-deps: this gate is for the shell's own code. Without it clippy
+        # also lints orama-core, whose pre-existing warnings the workspace
+        # already tolerates, and -D would fail the job for reasons that have
+        # nothing to do with the change under review.
+        run: cargo clippy -p orama-desktop --all-targets --no-deps -- -D warnings
+
+      - name: Test the desktop shell
+        # Single-threaded: the connector tests move process-global environment
+        # variables to sandbox themselves, and parallel tests would race over
+        # them and escape into the real home directory.
+        run: cargo test -p orama-desktop -- --test-threads=1
+
+  bundle:
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon and Intel are separate targets; a universal binary
+          # would double every download for users who need one half of it.
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            label: macos-arm64
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            label: macos-x64
+          - platform: ubuntu-22.04
+            args: ""
+            label: linux-x64
+          - platform: windows-latest
+            args: ""
+            label: windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 22.04 rather than latest: the AppImage and .deb link against the
+      # webkit2gtk on the build machine, and building on a newer glibc
+      # produces artifacts that will not start on an older distro.
+      - name: Install Linux webview dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential curl wget file libxdo-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ contains(matrix.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ${{ matrix.label }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: |
+          npm --prefix apps/web ci
+          npm --prefix apps/desktop ci
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          # Only publish from a tag. A manual run still produces installers,
+          # but attaches them to the run instead of inventing a release.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && 'Orama __VERSION__' || '' }}
+          releaseDraft: true
+          prerelease: false
+          # Let the action collect its own output. A hand-written glob has to
+          # guess where each bundler wrote to — and a cross-compiled macOS
+          # build does not land in the same place as a native one.
+          uploadWorkflowArtifacts: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          workflowArtifactNamePattern: orama-${{ matrix.label }}
+          args: ${{ matrix.args }}

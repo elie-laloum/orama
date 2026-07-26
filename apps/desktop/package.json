@@ -1,0 +1,15 @@
+{
+  "name": "orama-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tauri shell around the Orama proxy and dashboard.",
+  "scripts": {
+    "build:web": "npm --prefix ../web run build",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icon": "tauri icon"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0"
+  }
+}

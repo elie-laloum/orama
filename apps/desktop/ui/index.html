@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orama</title>
+    <style>
+      /*
+       * The only page this app ships. It is shown when the proxy could not
+       * start, which means the dashboard — served by that proxy — does not
+       * exist to be shown. Deliberately dependency-free: a bundle that failed
+       * to load is not a good way to explain a failure to load.
+       */
+      :root {
+        color-scheme: light dark;
+        --bg: #fafafa;
+        --fg: #18181b;
+        --muted: #71717a;
+        --line: #e4e4e7;
+        --card: #ffffff;
+        --accent: #b45309;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #09090b;
+          --fg: #fafafa;
+          --muted: #a1a1aa;
+          --line: #27272a;
+          --card: #111113;
+          --accent: #fbbf24;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 2rem;
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        width: 100%;
+        max-width: 34rem;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 2rem;
+      }
+      h1 {
+        margin: 0 0 0.25rem;
+        font-size: 1.05rem;
+        letter-spacing: -0.01em;
+      }
+      p {
+        margin: 0 0 1rem;
+        color: var(--muted);
+      }
+      .badge {
+        display: inline-block;
+        margin-bottom: 1.25rem;
+        padding: 0.15rem 0.5rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--accent);
+        border: 1px solid currentColor;
+      }
+      #reason {
+        margin: 0 0 1.5rem;
+        padding: 0.85rem 1rem;
+        border-left: 2px solid var(--accent);
+        background: color-mix(in srgb, var(--accent) 8%, transparent);
+        border-radius: 0 6px 6px 0;
+        color: var(--fg);
+        font-size: 0.9rem;
+      }
+      h2 {
+        margin: 0 0 0.5rem;
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+      ul {
+        margin: 0;
+        padding-left: 1.1rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      li {
+        margin-bottom: 0.35rem;
+      }
+      code {
+        font-family: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, monospace;
+        font-size: 0.85em;
+        padding: 0.1rem 0.3rem;
+        border-radius: 4px;
+        background: color-mix(in srgb, var(--fg) 8%, transparent);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <span class="badge">Not running</span>
+      <h1>Orama could not start its proxy</h1>
+      <p>
+        Nothing is being captured, and no traffic is being relayed. Your agent
+        CLIs are unaffected unless they were already pointed here.
+      </p>
+
+      <p id="reason">The proxy could not start.</p>
+
+      <h2>What to try</h2>
+      <ul>
+        <li>Quit whatever else is holding the port, then reopen Orama.</li>
+        <li>
+          Or start on another port: set <code>ORAMA_PORT</code> before
+          launching. Remember that a harness already connected still points at
+          the old one.
+        </li>
+        <li>
+          The <code>orama</code> command-line tool is unaffected and can be run
+          with <code>orama start --port &lt;n&gt;</code>.
+        </li>
+      </ul>
+    </main>
+
+    <script>
+      // Injected by the shell before this document runs. Absent means the page
+      // was opened without a diagnosis, and the default text above stands.
+      var message = window.__ORAMA_ERROR__;
+      if (typeof message === "string" && message.length > 0) {
+        document.getElementById("reason").textContent = message;
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,32 @@
+[package]
+name = "orama-desktop"
+description = "Orama as a desktop app: the proxy and its dashboard in one window."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately NOT `orama`: the CLI crate already produces a binary by that
+# name, and two workspace members emitting the same filename silently overwrite
+# each other in `target/debug`. The installers still say "Orama" — that comes
+# from `productName`, not from this.
+[[bin]]
+name = "orama-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+orama-core = { path = "../../../core" }
+# No plugins: the window loads the proxy's own /ui over loopback, so the page
+# needs nothing from Tauri's IPC bridge. Fewer moving parts to keep in sync
+# with a dashboard that already works in a browser.
+tauri = { version = "2", features = [] }
+tokio.workspace = true
+anyhow.workspace = true
+
+[features]
+# Consumed by tauri-build; keeps `cargo build` honest about custom protocols.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

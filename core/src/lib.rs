@@ -1,8 +1,8 @@
-//! orama-core — transparent interception proxy for Claude Code API traffic.
+//! orama-core — transparent interception proxy for coding-agent API traffic.
 //!
-//! This crate holds the reusable logic (config, server, relay, storage) so a
-//! later Tauri desktop app can depend on it directly. The `cli` crate is a thin
-//! binary wrapper.
+//! This crate holds the reusable logic (config, server, relay, storage). Both
+//! front ends are thin wrappers over it: the `cli` crate is a binary, and
+//! `apps/desktop` is a Tauri window pointed at the server this crate runs.
 
 pub mod api;
 pub mod catalog;
@@ -19,4 +19,4 @@ pub mod store;
 pub mod util;
 
 pub use config::Config;
-pub use server::serve;
+pub use server::{bind, serve, Bound};

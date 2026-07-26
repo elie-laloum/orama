@@ -176,13 +176,24 @@ pub fn config_path(harness: Harness) -> Result<PathBuf, ConnectError> {
     })
 }
 
+/// The directory Orama keeps its own files in — `$ORAMA_HOME`, or `~/.orama`.
+///
+/// Public because the desktop shell needs it for the same reason this module
+/// does: a windowed app is launched from a desktop entry, not a shell, so its
+/// working directory is arbitrary and a relative default would scatter a
+/// database wherever the launcher happened to start. Both callers resolving it
+/// here means `ORAMA_HOME` moves everything at once, which is what makes the
+/// connector tests safe to sandbox.
+pub fn orama_home() -> Result<PathBuf, ConnectError> {
+    match std::env::var_os("ORAMA_HOME").filter(|value| !value.is_empty()) {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(home_dir().ok_or(ConnectError::NoHome)?.join(".orama")),
+    }
+}
+
 /// Where Orama records what it changed, so a disconnect can put it back.
 fn state_path() -> Result<PathBuf, ConnectError> {
-    let dir = match std::env::var_os("ORAMA_HOME").filter(|value| !value.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => home_dir().ok_or(ConnectError::NoHome)?.join(".orama"),
-    };
-    Ok(dir.join("connections.json"))
+    Ok(orama_home()?.join("connections.json"))
 }
 
 #[derive(Debug, thiserror::Error)]

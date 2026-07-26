@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli"]
+members = ["core", "cli", "apps/desktop/src-tauri"]
+# The desktop shell needs system WebKit headers that a headless checkout has no
+# reason to install, so it is a member (one lockfile, one dependency graph) but
+# not a default one. `cargo build` and `cargo test` stay buildable anywhere;
+# `cargo build -p orama-desktop` opts in.
+default-members = ["core", "cli"]
 
 [workspace.package]
 version = "0.1.0"
