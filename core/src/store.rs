@@ -86,8 +86,17 @@ pub fn spawn_writer(path: impl AsRef<Path>) -> anyhow::Result<StoreHandle> {
     // The writer task owns the connection for its entire lifetime.
     tokio::task::spawn_blocking(move || {
         while let Some(record) = rx.blocking_recv() {
-            if let Err(err) = insert(&conn, &record) {
-                eprintln!("tracer: failed to persist call record: {err}");
+            match insert(&conn, &record) {
+                Ok(id) => {
+                    // The raw row is already durable, so derivation runs second
+                    // and its failures are recorded rather than propagated.
+                    // Deriving from the in-memory record matches deriving from
+                    // the stored row: redaction only touches auth headers, which
+                    // the derived layer never reads.
+                    let stored = StoredCall { id, record };
+                    crate::derive::write::derive_live(&conn, &stored);
+                }
+                Err(err) => eprintln!("tracer: failed to persist call record: {err}"),
             }
         }
     });
@@ -139,6 +148,23 @@ const MIGRATIONS: &[Migration] = &[
     // whole conversation, so only fingerprints, counters and short excerpts land
     // in derived rows.
     Migration::Sql(DERIVED_SCHEMA_V3),
+    // v4 — signals the trace model needs, computed per call but only meaningful
+    // when read in session order.
+    Migration::AddColumn {
+        table: "generations",
+        column: "new_user_turn",
+        ddl: "ALTER TABLE generations ADD COLUMN new_user_turn INTEGER NOT NULL DEFAULT 0",
+    },
+    Migration::AddColumn {
+        table: "generations",
+        column: "first_turn_hash",
+        ddl: "ALTER TABLE generations ADD COLUMN first_turn_hash TEXT",
+    },
+    Migration::AddColumn {
+        table: "generations",
+        column: "depth",
+        ddl: "ALTER TABLE generations ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+    },
 ];
 
 /// Derived-layer DDL. Kept separate for readability; applied as migration v3.

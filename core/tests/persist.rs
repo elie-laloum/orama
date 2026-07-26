@@ -102,5 +102,18 @@ async fn roundtrip_is_persisted_with_redacted_auth() {
         "a non-streaming response has no SSE capture"
     );
 
+    // The writer derives immediately after the raw insert commits, so the
+    // analytics layer is queryable without a separate backfill pass.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (derived, failures): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM generations), (SELECT COUNT(*) FROM derive_failures)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(derived, 1, "the live write path must derive as it captures");
+    assert_eq!(failures, 0);
+
     let _ = std::fs::remove_file(&db);
 }

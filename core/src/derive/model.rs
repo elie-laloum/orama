@@ -93,6 +93,11 @@ pub struct GenerationRow {
     pub messages_count: Option<i64>,
     pub context_chars: Option<i64>,
     pub history_prefix_hash: Option<String>,
+    /// The last history turn is a genuine user message rather than a
+    /// tool-result continuation — i.e. this call opens a new user turn.
+    pub new_user_turn: bool,
+    /// Identity of the conversation root, used to spot a branch or a restart.
+    pub first_turn_hash: Option<String>,
     pub tool_call_count: i64,
     pub tools_called: Option<String>,
     pub user_prompt: Option<String>,
