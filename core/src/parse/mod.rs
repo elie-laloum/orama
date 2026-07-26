@@ -3,6 +3,7 @@
 mod claude_code;
 pub mod diagnostics;
 pub mod model;
+mod openai;
 pub mod session;
 pub mod signals;
 
@@ -16,33 +17,49 @@ pub trait ProviderParser {
     fn parse(&self, call: &StoredCall) -> NormalizedCall;
 }
 
-/// Detect the provider from captured request headers.
-pub fn detect(headers: &Value) -> Provider {
-    let Some(headers) = headers.as_object() else {
-        return Provider::Unknown;
-    };
-    let value = |name: &str| {
+/// Detect the provider from a captured request.
+///
+/// Headers identify the client; the URL identifies the dialect. Both are
+/// consulted because a harness may speak OpenAI's wire format to a
+/// non-OpenAI endpoint, and the dialect is what decides how to parse.
+pub fn detect(headers: &Value, url: &str) -> Provider {
+    let header = |name: &str| {
         headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .and_then(|(_, value)| value.as_str())
+            .as_object()
+            .and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .and_then(|(_, value)| value.as_str())
+            })
             .unwrap_or("")
     };
-    if value("x-app").eq_ignore_ascii_case("cli")
-        || value("user-agent")
-            .to_ascii_lowercase()
-            .contains("claude-cli")
+    let agent = header("user-agent").to_ascii_lowercase();
+
+    if header("x-app").eq_ignore_ascii_case("cli")
+        || agent.contains("claude-cli")
+        || !header("anthropic-version").is_empty()
+        || url.contains("/v1/messages")
     {
-        Provider::ClaudeCode
-    } else {
-        Provider::Unknown
+        return Provider::ClaudeCode;
     }
+    if url.contains("/chat/completions")
+        || url.contains("/v1/responses")
+        || !header("openai-organization").is_empty()
+        || agent.contains("openai")
+        || agent.contains("codex")
+        || agent.contains("opencode")
+    {
+        return Provider::OpenAi;
+    }
+    Provider::Unknown
 }
 
 /// Derive a normalized representation from a stored call.
 pub fn parse_call(call: &StoredCall) -> NormalizedCall {
-    match detect(&call.record.request_headers) {
+    match detect(&call.record.request_headers, &call.record.url) {
         Provider::ClaudeCode => claude_code::ClaudeCodeParser.parse(call),
+        Provider::OpenAi => openai::OpenAiParser.parse(call),
         Provider::Unknown => raw_fallback(call),
     }
 }

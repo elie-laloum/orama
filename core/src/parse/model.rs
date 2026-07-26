@@ -6,7 +6,10 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    /// Anthropic Messages dialect (Claude Code and anything else speaking it).
     ClaudeCode,
+    /// OpenAI dialect — Chat Completions or Responses. Codex and opencode.
+    OpenAi,
     Unknown,
 }
 
@@ -56,6 +59,9 @@ pub enum Role {
     User,
     Assistant,
     Tool,
+    /// An inline system or developer turn. Both dialects send these; without a
+    /// variant they collapse into `Other` and disappear from every count.
+    System,
     Other,
 }
 

@@ -66,6 +66,10 @@ pub fn derive_one(call: &StoredCall) -> Derived {
             generation.provider = "anthropic".to_owned();
             generation.framework = Some("claude-code".to_owned());
         }
+        Provider::OpenAi => {
+            generation.provider = "openai".to_owned();
+            generation.framework = framework_of(headers);
+        }
         Provider::Unknown => generation.provider = "unknown".to_owned(),
     }
 
@@ -75,6 +79,7 @@ pub fn derive_one(call: &StoredCall) -> Derived {
     thread_shape(&mut generation, &normalized);
     response_fields(
         &mut generation,
+        &normalized,
         record
             .response_reconstructed
             .as_ref()
@@ -97,6 +102,30 @@ pub fn derive_one(call: &StoredCall) -> Derived {
         generation,
         tool_calls,
     }
+}
+
+/// Which harness produced an OpenAI-dialect call.
+///
+/// Provider and framework are orthogonal: several harnesses speak the same
+/// dialect, and knowing which one sent the traffic is what makes per-tool and
+/// per-agent analysis meaningful.
+fn framework_of(headers: &Value) -> Option<String> {
+    let agent = extract::header(headers, "user-agent")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let originator = extract::header(headers, "originator")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for (needle, name) in [
+        ("codex", "codex"),
+        ("opencode", "opencode"),
+        ("pi.dev", "pi-dev"),
+    ] {
+        if agent.contains(needle) || originator.contains(needle) {
+            return Some(name.to_owned());
+        }
+    }
+    Some("openai-sdk".to_owned())
 }
 
 /// Session, account and device identity, plus upstream correlation ids.
@@ -279,18 +308,28 @@ fn is_injected(text: &str) -> bool {
 }
 
 /// Usage, stop reason and the served model, from the assembled response.
-fn response_fields(row: &mut GenerationRow, message: Option<&Value>) {
+///
+/// The four core token counters come from the normalized call, which each
+/// provider parser has already mapped onto one shape. Only the extras that
+/// genuinely have no analogue elsewhere — the cache TTL split, thinking tokens,
+/// service tier — are read from the raw Anthropic payload.
+fn response_fields(row: &mut GenerationRow, normalized: &NormalizedCall, message: Option<&Value>) {
+    row.input_tokens = normalized.usage.input.map(|value| value as i64);
+    row.output_tokens = normalized.usage.output.map(|value| value as i64);
+    // Cache counters describe portions of input and are never re-added here.
+    row.total_tokens = row.input_tokens.zip(row.output_tokens).map(|(a, b)| a + b);
+    row.cache_creation_tokens = normalized.usage.cache_creation.map(|value| value as i64);
+    row.cache_read_tokens = normalized.usage.cache_read.map(|value| value as i64);
+
     let Some(message) = message else { return };
-    if message.get("type").and_then(Value::as_str) == Some("error") {
+    // Both dialects signal failure in the body; neither is an assistant turn.
+    if message.get("type").and_then(Value::as_str) == Some("error")
+        || message.get("error").is_some_and(|value| !value.is_null())
+    {
         return;
     }
+
     let usage = extract::usage(message);
-    row.input_tokens = usage.input;
-    row.output_tokens = usage.output;
-    // Cache counters describe portions of input and are never re-added here.
-    row.total_tokens = usage.input.zip(usage.output).map(|(a, b)| a + b);
-    row.cache_creation_tokens = usage.cache_creation;
-    row.cache_read_tokens = usage.cache_read;
     row.cache_creation_5m_tokens = usage.cache_5m;
     row.cache_creation_1h_tokens = usage.cache_1h;
     row.thinking_tokens = usage.thinking;
@@ -300,9 +339,20 @@ fn response_fields(row: &mut GenerationRow, message: Option<&Value>) {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // `stop_reason` is Anthropic's name for it, `finish_reason` OpenAI's.
     row.stop_reason = message
         .get("stop_reason")
         .and_then(Value::as_str)
+        .or_else(|| {
+            message
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            message
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+        })
         .map(str::to_owned);
     row.stop_sequence = message
         .get("stop_sequence")

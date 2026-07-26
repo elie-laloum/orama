@@ -17,6 +17,8 @@
 //! token count). Reconstruction is best-effort: a partial or malformed stream
 //! yields whatever could be assembled plus an `error` string.
 
+mod openai;
+
 use serde_json::{json, Map, Value};
 
 /// Outcome of reconstructing a raw SSE stream.
@@ -70,8 +72,31 @@ fn parse_sse(raw: &str) -> Vec<SseEvent> {
     events
 }
 
-/// Reconstruct the assembled message JSON from a raw SSE stream.
+/// Reconstruct the assembled response from a raw SSE stream.
+///
+/// Dispatches on the wire dialect rather than assuming Anthropic: the relay is
+/// a catch-all proxy and cannot know which provider it just forwarded to.
 pub fn reconstruct(raw: &str) -> Reconstructed {
+    if is_openai_stream(raw) {
+        openai::reconstruct(raw)
+    } else {
+        reconstruct_anthropic(raw)
+    }
+}
+
+/// Does this stream look like OpenAI's wire format?
+///
+/// Anthropic names every event (`event: message_start`); OpenAI's Chat
+/// Completions stream is bare `data:` frames terminated by `[DONE]`, and its
+/// Responses stream names events under a `response.` prefix.
+fn is_openai_stream(raw: &str) -> bool {
+    raw.contains("chat.completion.chunk")
+        || raw.contains("data: [DONE]")
+        || raw.contains("event: response.")
+}
+
+/// Reconstruct an Anthropic Messages stream.
+fn reconstruct_anthropic(raw: &str) -> Reconstructed {
     let mut out = Reconstructed::default();
     let events = parse_sse(raw);
 

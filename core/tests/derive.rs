@@ -549,3 +549,125 @@ fn alerts_rebuild_cleanly_rather_than_accumulating() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+/// A Codex-style call in the OpenAI dialect. Nothing about the derived layer
+/// should care which provider it came from.
+fn openai_call() -> CallRecord {
+    CallRecord {
+        timestamp_start: "2026-07-26T09:00:00Z".into(),
+        timestamp_end: Some("2026-07-26T09:00:02Z".into()),
+        method: "POST".into(),
+        url: "/v1/chat/completions".into(),
+        request_headers: json!({
+            "user-agent": "codex_cli_rs/0.4.0",
+            "session_id": "codex-session-1",
+        }),
+        request_body: Some(json!({
+            "model": "gpt-x",
+            "messages": [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "refactor the parser"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "apply_patch", "parameters": {"type": "object"}}}]
+        })),
+        response_status: Some(200),
+        response_body: Some(json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-x-2026",
+            "choices": [{"message": {"role": "assistant", "content": "done",
+                         "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "apply_patch",
+                                          "arguments": "{\"path\":\"a.rs\"}"}}]},
+                         "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 800, "completion_tokens": 40,
+                      "prompt_tokens_details": {"cached_tokens": 640}}
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn openai_traffic_derives_through_the_same_pipeline() {
+    let db = temp_db("openai");
+    let conn = seed(&db, &[openai_call()]);
+    backfill(&conn).unwrap();
+
+    let (provider, framework, model, resolved, stop, session): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT provider, framework, model, model_resolved, stop_reason, session_id \
+             FROM generations",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(provider, "openai");
+    // Provider and harness are separate axes; several harnesses share a dialect.
+    assert_eq!(framework, "codex");
+    assert_eq!(model, "gpt-x");
+    assert_eq!(resolved, "gpt-x-2026");
+    // OpenAI calls it finish_reason; it lands in the same column either way.
+    assert_eq!(stop, "tool_calls");
+    assert_eq!(session, "codex-session-1");
+
+    let (input, output, cache_read, cache_write): (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    ) = conn
+        .query_row(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens \
+             FROM generations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(input, Some(800));
+    assert_eq!(output, Some(40));
+    assert_eq!(cache_read, Some(640));
+    // OpenAI never reports a cache write — absent, not zero.
+    assert_eq!(cache_write, None);
+
+    // Tool calls materialize identically to the Anthropic path.
+    let (name, declared): (String, i64) = conn
+        .query_row("SELECT name, was_declared FROM tool_calls", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(name, "apply_patch");
+    assert_eq!(declared, 1);
+
+    // gpt-x is not in the pricing table, so cost is unknown rather than zero,
+    // and that gap is reported rather than silently passing.
+    let cost: Option<f64> = conn
+        .query_row("SELECT cost_total_usd FROM generations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cost, None);
+    let unpriced: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM alerts WHERE rule_id = 'data_quality.pricing_unknown'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unpriced, 1);
+
+    let _ = std::fs::remove_file(&db);
+}
