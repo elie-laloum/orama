@@ -13,7 +13,7 @@ use axum::{
     http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        Html, IntoResponse, Response,
+        IntoResponse, Response,
     },
     routing::get,
     Json, Router,
@@ -69,7 +69,6 @@ pub fn routes(store: ReadStore) -> Router {
     Router::new()
         .route("/ui", get(ui_index))
         .route("/ui/", get(ui_index))
-        .route("/ui/main.js", get(ui_bundle))
         // Anything else under /ui belongs to the dashboard, not upstream. Without
         // this the relay's catch-all forwarded the UI's own asset requests —
         // sourcemaps, favicons — to the model provider, which then appeared in
@@ -394,32 +393,34 @@ pub fn detail_json(call: &StoredCall) -> Value {
     })
 }
 
-/// GET /ui — the production React/Rspack dashboard bundle.
-async fn ui_index() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        Html(UI_HTML),
-    )
+// The UI bundle, embedded at build time by `core/build.rs`.
+include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
+
+/// Serve one file out of the embedded bundle.
+fn asset(name: &str) -> Option<Response> {
+    UI_ASSETS
+        .iter()
+        .find(|(path, _, _)| *path == name)
+        .map(|(_, mime, bytes)| {
+            (
+                [(header::CONTENT_TYPE, *mime)],
+                axum::body::Body::from(*bytes),
+            )
+                .into_response()
+        })
 }
 
-/// Any other /ui path. The SPA owns this namespace, so an unknown asset is a
-/// 404 from the dashboard rather than a request forwarded to the provider.
-async fn ui_asset() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, "not found")
+/// GET /ui — the dashboard shell.
+async fn ui_index() -> Response {
+    asset("index.html")
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "UI bundle not built").into_response())
 }
 
-/// GET /ui/main.js — the compiled dashboard bundle.
-async fn ui_bundle() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        UI_BUNDLE,
-    )
+/// GET /ui/* — any other bundled asset: the script, the stylesheet, fonts.
+///
+/// This route also stops the relay's catch-all from forwarding the dashboard's
+/// own requests upstream, which previously sent asset 404s to the model
+/// provider and stored them as if they were model traffic.
+async fn ui_asset(Path(rest): Path<String>) -> Response {
+    asset(&rest).unwrap_or_else(|| (StatusCode::NOT_FOUND, "not found").into_response())
 }
-
-// Staged by `core/build.rs`, which falls back to a placeholder when the frontend
-// bundle has not been built. Compiling never requires a prior `npm run build`.
-const UI_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/ui_index.html"));
-const UI_BUNDLE: &str = include_str!(concat!(env!("OUT_DIR"), "/ui_main.js"));

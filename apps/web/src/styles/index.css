@@ -1,0 +1,100 @@
+@import "tailwindcss";
+
+/* Self-hosted: the tool runs locally and must not depend on a font CDN. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+/* Design tokens. Dense and quiet: small type, short rows, hairline borders,
+   one accent. Colour is never the only carrier of meaning — every severity
+   also has an icon and a label. */
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+
+  --text-2xs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-lg: 15px;
+  --text-xl: 19px;
+  --text-2xl: 24px;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  --color-bg: oklch(0.16 0.006 265);
+  --color-surface: oklch(0.19 0.006 265);
+  --color-raised: oklch(0.225 0.007 265);
+  --color-border: oklch(0.28 0.008 265);
+  --color-border-strong: oklch(0.35 0.01 265);
+  --color-fg: oklch(0.94 0.004 265);
+  --color-muted: oklch(0.66 0.012 265);
+  --color-faint: oklch(0.5 0.012 265);
+  --color-accent: oklch(0.68 0.17 268);
+  --color-accent-soft: oklch(0.32 0.07 268);
+
+  --color-ok: oklch(0.72 0.15 155);
+  --color-warn: oklch(0.79 0.14 78);
+  --color-error: oklch(0.66 0.2 24);
+  --color-critical: oklch(0.6 0.24 12);
+  /* Unknown gets its own hue. Absent data must never render as healthy. */
+  --color-unknown: oklch(0.52 0.02 265);
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  * {
+    border-color: var(--color-border);
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "cv05", "ss01";
+  }
+  /* Tabular figures everywhere numbers are compared down a column. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border-strong);
+    border-radius: 6px;
+    border: 3px solid var(--color-bg);
+  }
+  ::selection {
+    background: var(--color-accent-soft);
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+}
+
+@layer components {
+  /* One row height everywhere, so tables across surfaces scan identically. */
+  .row {
+    height: 30px;
+  }
+  .cell {
+    padding-inline: 10px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}

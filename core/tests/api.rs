@@ -102,7 +102,30 @@ async fn api_lists_calls_most_recent_first_and_serves_ui() {
     assert!(ct.contains("text/html"));
     let html = ui.text().await.unwrap();
     assert!(html.to_lowercase().contains("orama"));
-    assert!(html.contains("/api/calls"));
+    // The shell mounts the app; the API calls live in the bundle, not the HTML.
+    assert!(html.contains("id=\"root\""));
+
+    // Every asset the bundle references must be served from the binary. Serving
+    // only the entry script left the stylesheet and fonts to fall through to the
+    // relay, which forwarded them upstream.
+    for (path, expected) in [("/ui/main.js", "javascript"), ("/ui/main.css", "text/css")] {
+        let asset = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        assert_eq!(asset.status(), StatusCode::OK, "{path} should be served");
+        let kind = asset
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(kind.contains(expected), "{path} served as {kind}");
+    }
+
+    // An unknown /ui path is the dashboard's own 404, never a relayed request.
+    let missing = reqwest::get(format!("http://{addr}/ui/nope.js"))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
     // Read-only: POST to the API is not allowed.
     let post = reqwest::Client::new()
