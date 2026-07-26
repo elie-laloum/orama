@@ -8,6 +8,7 @@ pub mod api;
 pub mod config;
 pub mod derive;
 pub mod parse;
+pub mod pricing;
 pub mod reconstruct;
 pub mod relay;
 pub mod server;

@@ -37,6 +37,8 @@ pub fn write_derived(conn: &Connection, derived: &Derived) -> Result<()> {
             thinking_mode, thinking_budget, stop_sequences, context_management, compaction_requested,
             input_tokens, output_tokens, total_tokens, cache_creation_tokens, cache_read_tokens,
             cache_creation_5m_tokens, cache_creation_1h_tokens, cache_ttl_source, thinking_tokens,
+            cost_input_usd, cost_output_usd, cost_cache_write_usd, cost_cache_read_usd,
+            cost_total_usd, cost_uncached_equiv_usd, pricing_model_id, pricing_version,
             started_at, first_token_at, ended_at, ttft_ms, latency_ms,
             http_status, stop_reason, stop_sequence, is_error, error_kind, error_message,
             retry_count, should_retry, ratelimit_status, ratelimit_5h_utilization,
@@ -54,6 +56,8 @@ pub fn write_derived(conn: &Connection, derived: &Derived) -> Result<()> {
             :thinking_mode, :thinking_budget, :stop_sequences, :context_management, :compaction_requested,
             :input_tokens, :output_tokens, :total_tokens, :cache_creation_tokens, :cache_read_tokens,
             :cache_creation_5m_tokens, :cache_creation_1h_tokens, :cache_ttl_source, :thinking_tokens,
+            :cost_input_usd, :cost_output_usd, :cost_cache_write_usd, :cost_cache_read_usd,
+            :cost_total_usd, :cost_uncached_equiv_usd, :pricing_model_id, :pricing_version,
             :started_at, :first_token_at, :ended_at, :ttft_ms, :latency_ms,
             :http_status, :stop_reason, :stop_sequence, :is_error, :error_kind, :error_message,
             :retry_count, :should_retry, :ratelimit_status, :ratelimit_5h_utilization,
@@ -107,6 +111,14 @@ pub fn write_derived(conn: &Connection, derived: &Derived) -> Result<()> {
             ":cache_creation_1h_tokens": row.cache_creation_1h_tokens,
             ":cache_ttl_source": row.cache_ttl_source,
             ":thinking_tokens": row.thinking_tokens,
+            ":cost_input_usd": row.cost_input_usd,
+            ":cost_output_usd": row.cost_output_usd,
+            ":cost_cache_write_usd": row.cost_cache_write_usd,
+            ":cost_cache_read_usd": row.cost_cache_read_usd,
+            ":cost_total_usd": row.cost_total_usd,
+            ":cost_uncached_equiv_usd": row.cost_uncached_equiv_usd,
+            ":pricing_model_id": row.pricing_model_id,
+            ":pricing_version": row.pricing_version,
             ":started_at": row.started_at,
             ":first_token_at": row.first_token_at,
             ":ended_at": row.ended_at,
@@ -345,7 +357,7 @@ pub fn rollup_sessions(conn: &Connection, only: Option<&str>) -> Result<()> {
             started_at, ended_at, duration_ms,
             generation_count, tool_call_count, error_count,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, thinking_tokens,
-            cost_total_usd, peak_context_tokens, usage_coverage, parser_version
+            cost_total_usd, cache_savings_usd, peak_context_tokens, usage_coverage, parser_version
         )
         SELECT
             session_id,
@@ -373,7 +385,11 @@ pub fn rollup_sessions(conn: &Connection, only: Option<&str>) -> Result<()> {
             COUNT(*), SUM(tool_call_count), SUM(is_error),
             SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens),
             SUM(cache_creation_tokens), SUM(thinking_tokens),
-            SUM(cost_total_usd), MAX(input_tokens),
+            SUM(cost_total_usd),
+            -- What caching saved: never negative, since a write-heavy session
+            -- can cost more than its uncached equivalent.
+            MAX(0, SUM(COALESCE(cost_uncached_equiv_usd, 0)) - SUM(COALESCE(cost_total_usd, 0))),
+            MAX(input_tokens),
             CAST(SUM(input_tokens IS NOT NULL) AS REAL) / COUNT(*),
             ?1
         FROM generations g

@@ -61,6 +61,19 @@ pub struct GenerationRow {
     pub cache_ttl_source: Option<String>,
     pub thinking_tokens: Option<i64>,
 
+    // Cost. All `None` for a model absent from the pricing table — never zero,
+    // which would read as "this call was free".
+    pub cost_input_usd: Option<f64>,
+    pub cost_output_usd: Option<f64>,
+    pub cost_cache_write_usd: Option<f64>,
+    pub cost_cache_read_usd: Option<f64>,
+    pub cost_total_usd: Option<f64>,
+    /// What the call would have cost with no caching, so the UI can show what
+    /// the cache actually saved.
+    pub cost_uncached_equiv_usd: Option<f64>,
+    pub pricing_model_id: Option<String>,
+    pub pricing_version: Option<String>,
+
     // Timing
     pub started_at: String,
     pub first_token_at: Option<String>,

@@ -82,6 +82,7 @@ pub fn derive_one(call: &StoredCall) -> Derived {
     );
     cache_ttl_fallback(&mut generation, body);
     outcome(&mut generation, &normalized, headers, response_headers);
+    cost(&mut generation);
 
     let tool_calls = tool_calls(&normalized, &generation);
     generation.tool_call_count = tool_calls.len() as i64;
@@ -394,6 +395,33 @@ fn outcome(
         row.error_kind.as_deref(),
         Some("transport" | "http" | "stream_incomplete")
     );
+}
+
+/// Attribute cost, priced at the rates in effect when the call was captured.
+///
+/// The served model is preferred over the requested one: a fallback or an alias
+/// resolution means the bill follows what actually ran.
+fn cost(row: &mut GenerationRow) {
+    let model = row.model_resolved.as_deref().or(row.model.as_deref());
+    let tokens = crate::pricing::Tokens {
+        input: row.input_tokens,
+        output: row.output_tokens,
+        cache_read: row.cache_read_tokens,
+        cache_creation_5m: row.cache_creation_5m_tokens,
+        cache_creation_1h: row.cache_creation_1h_tokens,
+        cache_creation_total: row.cache_creation_tokens,
+    };
+    let Some(cost) = crate::pricing::price(model, &row.started_at, &tokens) else {
+        return;
+    };
+    row.cost_input_usd = Some(cost.input_usd);
+    row.cost_output_usd = Some(cost.output_usd);
+    row.cost_cache_write_usd = Some(cost.cache_write_usd);
+    row.cost_cache_read_usd = Some(cost.cache_read_usd);
+    row.cost_total_usd = Some(cost.total_usd);
+    row.cost_uncached_equiv_usd = Some(cost.uncached_equivalent_usd);
+    row.pricing_model_id = Some(cost.model_id.to_owned());
+    row.pricing_version = Some(crate::pricing::PRICING_VERSION.to_owned());
 }
 
 /// Tool invocations observed in this call, paired with their results.
