@@ -1,4 +1,43 @@
+# --- Rust / Cargo ---------------------------------------------------------
 /target
+**/*.rs.bk
+*.pdb
+
+# --- Capture databases ----------------------------------------------------
+# The proxy stores verbatim request/response bodies. Never commit them.
 *.sqlite
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 *.db
+
+# --- Node / frontend ------------------------------------------------------
+node_modules/
+apps/web/dist/
+*.tsbuildinfo
+.npm/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Secrets & local config ----------------------------------------------
+.env
+.env.*
+!.env.example
+# Local agent settings may contain API keys
+.claude/settings.local.json
+.mise.local.toml
+
+# --- Coverage / profiling -------------------------------------------------
+coverage/
+lcov.info
+*.profraw
+*.profdata
+
+# --- Editors & OS ---------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

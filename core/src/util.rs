@@ -54,8 +54,14 @@ mod tests {
     #[test]
     fn headers_join_duplicates() {
         let mut h = HeaderMap::new();
-        h.append(HeaderName::from_static("x-a"), HeaderValue::from_static("1"));
-        h.append(HeaderName::from_static("x-a"), HeaderValue::from_static("2"));
+        h.append(
+            HeaderName::from_static("x-a"),
+            HeaderValue::from_static("1"),
+        );
+        h.append(
+            HeaderName::from_static("x-a"),
+            HeaderValue::from_static("2"),
+        );
         let json = headers_to_json(&h);
         assert_eq!(json["x-a"], "1, 2");
     }
@@ -64,6 +70,9 @@ mod tests {
     fn body_json_parses_or_falls_back() {
         assert_eq!(body_to_json(b""), None);
         assert_eq!(body_to_json(br#"{"a":1}"#).unwrap()["a"], 1);
-        assert_eq!(body_to_json(b"not json").unwrap(), Value::String("not json".into()));
+        assert_eq!(
+            body_to_json(b"not json").unwrap(),
+            Value::String("not json".into())
+        );
     }
 }

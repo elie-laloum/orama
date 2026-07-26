@@ -228,9 +228,7 @@ fn append_str_field(block: &mut Value, field: &str, value: Option<&Value>) {
 
 /// Merge streaming `usage` fields into the message usage object.
 fn merge_usage(msg: &mut Map<String, Value>, usage: &Map<String, Value>) {
-    let entry = msg
-        .entry("usage".to_string())
-        .or_insert_with(|| json!({}));
+    let entry = msg.entry("usage".to_string()).or_insert_with(|| json!({}));
     if let Some(obj) = entry.as_object_mut() {
         for (k, v) in usage {
             obj.insert(k.clone(), v.clone());

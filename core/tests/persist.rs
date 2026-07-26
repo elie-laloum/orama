@@ -89,5 +89,18 @@ async fn roundtrip_is_persisted_with_redacted_auth() {
     assert_eq!(call.request_headers["authorization"], REDACTED);
     assert_eq!(call.request_body.as_ref().unwrap()["system"], "be nice");
 
+    // Non-streaming responses carry their body in `response_body`; it used to be
+    // forwarded to the client and dropped, leaving the exchange half-captured.
+    let body = call
+        .response_body
+        .as_ref()
+        .expect("a non-streaming response body must be captured");
+    assert_eq!(body["id"], "msg_x");
+    assert_eq!(body["content"][0]["text"], "pong");
+    assert!(
+        call.response_raw_sse.is_none(),
+        "a non-streaming response has no SSE capture"
+    );
+
     let _ = std::fs::remove_file(&db);
 }

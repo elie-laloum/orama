@@ -87,7 +87,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_probe_returns_ok() {
-        let cfg = Config::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, Config::default().upstream);
+        let cfg = Config::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+            Config::default().upstream,
+        );
         let listener = TcpListener::bind(SocketAddr::new(cfg.host, cfg.port))
             .await
             .unwrap();

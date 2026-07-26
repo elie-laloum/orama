@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod config;
+pub mod parse;
 pub mod reconstruct;
 pub mod relay;
 pub mod server;

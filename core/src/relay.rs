@@ -57,6 +57,10 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "host"
+            // Never forward the client's compression negotiation. Doing so
+            // disables reqwest's transparent decompression, which would make
+            // an SSE capture binary gzip data rather than parseable events.
+            | "accept-encoding"
     )
 }
 
@@ -147,7 +151,9 @@ async fn forward(
 
     let mut req = state.client.request(method.clone(), &url);
 
-    // Forward request headers verbatim except hop-by-hop; auth passes through.
+    // Forward request headers except hop-by-hop; auth passes through. In
+    // particular, accept-encoding is omitted so reqwest negotiates and
+    // transparently decodes compressed upstream SSE before we capture it.
     for (name, value) in headers.iter() {
         if is_hop_by_hop(name) {
             continue;
@@ -188,14 +194,22 @@ async fn forward(
     }
 
     if is_event_stream(&resp_headers) {
-        Ok(stream_teeing_response(builder, upstream_resp, record, state.store.clone()))
+        Ok(stream_teeing_response(
+            builder,
+            upstream_resp,
+            record,
+            state.store.clone(),
+        ))
     } else {
-        // Non-streaming: buffer the whole body, store, and return unchanged.
+        // Non-streaming: buffer the whole body, capture it, store, and return
+        // the bytes unchanged. The capture is what makes usage, stop_reason and
+        // the assistant turn available for non-streamed calls.
         let resp_body = match upstream_resp.bytes().await {
             Ok(b) => b,
             Err(err) => return Err((err.into(), record)),
         };
         record.timestamp_end = Some(now_rfc3339());
+        record.response_body = body_to_json(&resp_body);
         if let Some(store) = &state.store {
             store.record(record);
         }
@@ -303,5 +317,6 @@ mod tests {
         assert!(is_hop_by_hop(&HeaderName::from_static("connection")));
         assert!(!is_hop_by_hop(&HeaderName::from_static("authorization")));
         assert!(!is_hop_by_hop(&HeaderName::from_static("content-type")));
+        assert!(is_hop_by_hop(&HeaderName::from_static("accept-encoding")));
     }
 }

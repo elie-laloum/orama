@@ -11,7 +11,14 @@ repository = "https://github.com/orama/tracer"
 [workspace.dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "stream",
+  "gzip",
+  "brotli",
+  "deflate",
+  "zstd",
+] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -25,4 +32,5 @@ http = "1"
 futures = "0.3"
 async-stream = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
-time = { version = "0.3", features = ["formatting", "macros"] }
+blake3 = "1"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }

@@ -3,6 +3,7 @@ name = "tracer-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [lib]
 name = "tracer_core"
@@ -23,6 +24,7 @@ futures.workspace = true
 async-stream.workspace = true
 rusqlite.workspace = true
 time.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 async-stream.workspace = true
