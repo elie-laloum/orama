@@ -42,8 +42,8 @@ Requirements:
 - **Node.js 20+** — only to build the dashboard bundle
 
 ```bash
-git clone https://github.com/orama/tracer
-cd tracer
+git clone https://github.com/elie-laloum/orama
+cd orama
 
 # Build the web dashboard (embedded into the binary at compile time)
 cd apps/web && npm install && npm run build && cd ../..
@@ -153,7 +153,8 @@ databases and a stub upstream — no network and no real API key required.
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a PR:
+Issues and pull requests are welcome on
+[GitHub](https://github.com/elie-laloum/orama). Before opening a PR:
 
 1. Keep the capture path untouched unless that is the point of the change —
    tracing must stay best-effort and never block or alter the client's request.

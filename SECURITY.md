@@ -19,11 +19,12 @@ security fixes. There are no backports to earlier tags.
 
 **Do not open a public issue for a vulnerability.**
 
-Report privately through either channel:
+Report it privately through GitHub **Security Advisories**: go to the
+[Security tab](https://github.com/elie-laloum/orama/security/advisories/new) of
+the repository and choose *Report a vulnerability*. The report stays private
+until an advisory is published, and the discussion stays attached to the code.
 
-- GitHub **Security Advisories** → *Report a vulnerability* on the repository
-  (preferred — keeps the discussion attached to the code).
-- Email **pro@elielaloum.com** with `[orama security]` in the subject.
+This is the only accepted channel — there is no security mailing address.
 
 Please include:
 

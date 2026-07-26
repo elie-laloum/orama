@@ -6,7 +6,7 @@ members = ["core", "cli"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/orama/tracer"
+repository = "https://github.com/elie-laloum/orama"
 
 [workspace.dependencies]
 axum = "0.7"

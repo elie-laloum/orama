@@ -6,9 +6,13 @@ decision, ask someone here.
 
 ## Current maintainers
 
-| Name | GitHub | Contact | Areas |
-| --- | --- | --- | --- |
-| Elie Laloum | [@elielaloum](https://github.com/elielaloum) | pro@elielaloum.com | Everything (lead) |
+| Name | GitHub | Areas |
+| --- | --- | --- |
+| Elie Laloum | [@elie-laloum](https://github.com/elie-laloum) | Everything (lead) |
+
+Reach maintainers through GitHub issues, pull request review threads, or — for
+anything security-sensitive — a private advisory. No email addresses are
+published here on purpose.
 
 Emeritus maintainers: _none yet._
 
