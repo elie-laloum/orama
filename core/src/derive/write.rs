@@ -254,7 +254,10 @@ pub fn derive_and_write(conn: &Connection, call: &StoredCall) -> Option<String> 
 /// Trace membership depends on the calls around it, so the whole session is
 /// re-assembled — scoped to one session, this stays cheap as history grows.
 pub fn derive_live(conn: &Connection, call: &StoredCall) {
+    // The raw row is already committed by the time this runs.
+    crate::api::events::publish("capture.started", call.id, None, None);
     let Some(session) = derive_and_write(conn, call) else {
+        crate::api::events::publish("derive.failed", call.id, None, None);
         return;
     };
     if let Err(err) = super::trace::assemble_session(conn, &session) {
@@ -266,6 +269,16 @@ pub fn derive_live(conn: &Connection, call: &StoredCall) {
     if let Err(err) = crate::detect::evaluate(conn, &crate::detect::SignalPolicy::default()) {
         eprintln!("orama: failed to evaluate detectors: {err}");
     }
+    // Emitted last, so a client that reacts to it finds every derived table
+    // already consistent.
+    let trace = conn
+        .query_row(
+            "SELECT trace_id FROM generations WHERE call_id = ?1",
+            [call.id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap_or(None);
+    crate::api::events::publish("generation.derived", call.id, Some(session), trace);
 }
 
 /// Drop every derived row. `calls` is untouched.

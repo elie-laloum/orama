@@ -29,6 +29,9 @@ use crate::{
     store::{get_call, list_calls, StoredCall},
 };
 
+pub mod events;
+pub mod v2;
+
 /// Read-only handle to the capture DB for the API/UI.
 #[derive(Clone)]
 pub struct ReadStore {
@@ -49,7 +52,7 @@ impl ReadStore {
     /// shared-memory index, which a strictly read-only handle cannot create.
     /// `query_only` then enforces the read-only guarantee inside SQLite itself,
     /// so no handler can mutate stored data.
-    fn open(&self) -> rusqlite::Result<rusqlite::Connection> {
+    pub(crate) fn open(&self) -> rusqlite::Result<rusqlite::Connection> {
         use rusqlite::OpenFlags;
         let conn = rusqlite::Connection::open_with_flags(
             self.db_path.as_ref(),
@@ -81,6 +84,7 @@ pub fn routes(store: ReadStore) -> Router {
         .route("/api/ui/dashboard", get(dashboard_handler))
         .route("/api/ui/events", get(events_handler))
         .route("/api/ui/alerts", get(alerts_handler))
+        .merge(v2::routes())
         .with_state(store)
 }
 
