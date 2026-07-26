@@ -33,6 +33,47 @@ pub fn headers_to_json(headers: &HeaderMap) -> Value {
     Value::Object(map)
 }
 
+/// Decompress a request body for capture, per its `content-encoding`.
+///
+/// Only the stored copy is decoded; the bytes forwarded upstream are always the
+/// originals. This is not a rewrite of the exchange but a repair of the record:
+/// Codex sends `content-encoding: zstd`, and lossily decoding those bytes as
+/// UTF-8 produced a `request_body` of mojibake — no model, no tools, no prompt,
+/// and nothing a rebuild could ever recover.
+///
+/// An encoding we do not implement, or a payload that fails to inflate, yields
+/// the original bytes. Storing them undecoded is honest; a body invented from a
+/// failed decode would not be.
+pub fn decode_body(encoding: Option<&str>, body: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+
+    let Some(encoding) = encoding else {
+        return body.to_vec();
+    };
+    // `content-encoding` is an ordered list, but a client sending more than one
+    // layer is vanishingly rare; take the whole value as a single codec name.
+    let decoded = match encoding.trim().to_ascii_lowercase().as_str() {
+        "zstd" => zstd::stream::decode_all(body).ok(),
+        "gzip" | "x-gzip" => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .read_to_end(&mut out)
+                .ok()
+                .map(|_| out)
+        }
+        "deflate" => {
+            let mut out = Vec::new();
+            flate2::read::ZlibDecoder::new(body)
+                .read_to_end(&mut out)
+                .ok()
+                .map(|_| out)
+        }
+        // "identity", anything unknown: nothing to undo.
+        _ => None,
+    };
+    decoded.unwrap_or_else(|| body.to_vec())
+}
+
 /// Best-effort parse of a byte body into JSON. Returns `None` for empty bodies
 /// and falls back to a JSON string for non-JSON payloads so the raw content is
 /// never lost.
@@ -64,6 +105,27 @@ mod tests {
         );
         let json = headers_to_json(&h);
         assert_eq!(json["x-a"], "1, 2");
+    }
+
+    #[test]
+    fn a_zstd_body_is_decoded_for_capture() {
+        // The shape Codex actually sends: a JSON request body under zstd.
+        let json = br#"{"model":"gpt-5.6-luna","input":[]}"#;
+        let squashed = zstd::stream::encode_all(&json[..], 0).unwrap();
+        assert_ne!(squashed, json.to_vec(), "fixture must really be compressed");
+
+        let decoded = decode_body(Some("zstd"), &squashed);
+        assert_eq!(decoded, json.to_vec());
+        assert_eq!(body_to_json(&decoded).unwrap()["model"], "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn an_undecodable_body_is_kept_rather_than_invented() {
+        // Wrong codec named: return the bytes untouched instead of guessing.
+        let bytes = b"\x01\x02not really gzip";
+        assert_eq!(decode_body(Some("gzip"), bytes), bytes.to_vec());
+        assert_eq!(decode_body(Some("br"), bytes), bytes.to_vec());
+        assert_eq!(decode_body(None, bytes), bytes.to_vec());
     }
 
     #[test]

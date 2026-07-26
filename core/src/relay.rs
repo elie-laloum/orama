@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::parse::model::Provider;
 use crate::store::{CallRecord, StoreHandle};
-use crate::util::{body_to_json, headers_to_json, now_rfc3339};
+use crate::util::{body_to_json, decode_body, headers_to_json, now_rfc3339};
 
 /// Shared state handed to the catch-all handler.
 #[derive(Clone)]
@@ -145,7 +145,14 @@ pub async fn relay(
             .map(|pq| pq.to_string())
             .unwrap_or_else(|| uri.path().to_string()),
         request_headers: headers_to_json(&headers),
-        request_body: body_to_json(&body_bytes),
+        // Decoded for the record only; `body_bytes` still goes upstream as it
+        // arrived. A compressed body stored verbatim is unparseable forever.
+        request_body: body_to_json(&decode_body(
+            headers
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            &body_bytes,
+        )),
         ..Default::default()
     };
 
@@ -176,12 +183,34 @@ pub async fn relay(
 }
 
 /// Does this response body stream as Server-Sent Events?
-fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+///
+/// `accepted_events` is whether the client asked for `text/event-stream`, and
+/// it is consulted only when the response declares no content type at all.
+/// ChatGPT's Codex backend sends exactly that — a chunked SSE body with no
+/// `content-type` — so trusting the response header alone buffered a live
+/// stream to completion before the client saw a byte of it, and left
+/// `response_raw_sse` empty so nothing was ever reconstructed.
+///
+/// Guessing here is safe in the direction it can be wrong: the streaming path
+/// forwards each chunk verbatim as it arrives, so a non-SSE body treated as a
+/// stream still reaches the client unchanged; only the reconstruction attempt
+/// fails, and it records that rather than inventing a message.
+fn is_event_stream(headers: &reqwest::header::HeaderMap, accepted_events: bool) -> bool {
+    match headers.get(reqwest::header::CONTENT_TYPE) {
+        Some(value) => value
+            .to_str()
+            .map(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
+            .unwrap_or(false),
+        None => accepted_events,
+    }
+}
+
+/// Did the client ask for Server-Sent Events?
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
     headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
-        .unwrap_or(false)
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.to_ascii_lowercase().contains("text/event-stream"))
 }
 
 /// Perform the outbound request and translate the upstream response back.
@@ -245,7 +274,7 @@ async fn forward(
         }
     }
 
-    if is_event_stream(&resp_headers) {
+    if is_event_stream(&resp_headers, accepts_event_stream(headers)) {
         Ok(stream_teeing_response(
             builder,
             upstream_resp,
@@ -272,10 +301,69 @@ async fn forward(
     }
 }
 
+/// A streaming capture that persists itself however the stream ends.
+///
+/// The enqueue lives in `Drop`, not at the end of the generator, because those
+/// are not the same moment. An `async_stream` body only executes past its last
+/// `yield` if it is polled again — and a client that stops reading the instant
+/// it has what it needs gives it no such poll. Codex does exactly that on an
+/// SSE turn, so with the enqueue in the tail the second and subsequent turns of
+/// a session were relayed perfectly and never recorded, with nothing anywhere
+/// reporting a capture had gone missing.
+///
+/// `Drop` runs in every case — completed, errored, or abandoned — so a capture
+/// is now lost only if the process dies.
+struct StreamCapture {
+    record: CallRecord,
+    raw_sse: String,
+    first_chunk_at: Option<String>,
+    store: Option<StoreHandle>,
+}
+
+impl StreamCapture {
+    fn new(record: CallRecord, store: Option<StoreHandle>) -> Self {
+        Self {
+            record,
+            raw_sse: String::new(),
+            first_chunk_at: None,
+            store,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.first_chunk_at.is_none() {
+            self.first_chunk_at = Some(now_rfc3339());
+        }
+        // A verbatim copy, lossily decoded for storage only; the bytes
+        // forwarded to the client are untouched.
+        self.raw_sse.push_str(&String::from_utf8_lossy(chunk));
+    }
+
+    fn note_error(&mut self, err: impl std::fmt::Display) {
+        self.record.error = Some(format!("stream error: {err}"));
+    }
+}
+
+impl Drop for StreamCapture {
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        // `std::mem::take` rather than a clone: this runs on the request path
+        // for every streamed call, and the SSE can be hundreds of kilobytes.
+        let mut record = std::mem::take(&mut self.record);
+        record.timestamp_first_chunk = self.first_chunk_at.take();
+        record.timestamp_end = Some(now_rfc3339());
+        record.response_raw_sse = Some(std::mem::take(&mut self.raw_sse));
+        finalize_stream_record(&mut record);
+        store.record(record);
+    }
+}
+
 /// Build a streaming response that forwards each upstream SSE chunk to the
-/// client the instant it arrives while accumulating a verbatim copy. When the
-/// stream ends (or errors), the record is finalised with the raw SSE, the
-/// first-chunk/end timestamps, and any error, then enqueued for persistence.
+/// client the instant it arrives while accumulating a verbatim copy. The record
+/// is finalised and enqueued when the capture drops, which covers a stream that
+/// ends, errors, or is abandoned by the client.
 fn stream_teeing_response(
     builder: axum::http::response::Builder,
     upstream_resp: reqwest::Response,
@@ -285,20 +373,14 @@ fn stream_teeing_response(
     use futures::StreamExt;
 
     let mut upstream = upstream_resp.bytes_stream();
-    let mut record = record;
-    let mut raw_sse = String::new();
-    let mut first_chunk_at: Option<String> = None;
+    // Moved into the generator, so it drops with it.
+    let mut capture = StreamCapture::new(record, store);
 
     let tee = async_stream::stream! {
         loop {
             match upstream.next().await {
                 Some(Ok(chunk)) => {
-                    if first_chunk_at.is_none() {
-                        first_chunk_at = Some(now_rfc3339());
-                    }
-                    // Accumulate a verbatim copy (lossy UTF-8 for storage only;
-                    // the bytes forwarded to the client are untouched).
-                    raw_sse.push_str(&String::from_utf8_lossy(&chunk));
+                    capture.push(&chunk);
                     // Forward the exact bytes downstream immediately.
                     yield Ok::<_, std::io::Error>(chunk);
                 }
@@ -306,20 +388,15 @@ fn stream_teeing_response(
                     // A mid-stream upstream error: surface it, record it, and
                     // stop. The client stream ends here rather than hanging.
                     eprintln!("orama: upstream stream error: {err}");
-                    record.error = Some(format!("stream error: {err}"));
+                    capture.note_error(err);
                     break;
                 }
                 None => break,
             }
         }
-
-        record.timestamp_first_chunk = first_chunk_at.clone();
-        record.timestamp_end = Some(now_rfc3339());
-        record.response_raw_sse = Some(raw_sse.clone());
-        finalize_stream_record(&mut record);
-        if let Some(store) = &store {
-            store.record(record.clone());
-        }
+        // No enqueue here on purpose — dropping `capture` does it, and that
+        // happens whether or not this line is ever reached.
+        drop(capture);
     };
 
     builder

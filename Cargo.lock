@@ -1020,6 +1020,7 @@ dependencies = [
  "axum",
  "blake3",
  "bytes",
+ "flate2",
  "futures",
  "http",
  "reqwest",
@@ -1031,6 +1032,7 @@ dependencies = [
  "tokio",
  "toml_edit",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
