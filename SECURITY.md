@@ -88,6 +88,14 @@ belongs to the user running it.
   verification.
 - **A malicious upstream URL passed via `--upstream`** — you chose where to send
   your own traffic.
+- **The daily catalogue fetch from `models.dev`.** Model rates and limits come
+  from a public document rather than a table maintained here, so a running proxy
+  requests it once at startup and once a day after. The request carries no
+  capture data — only an `If-None-Match` header — and the response is parsed and
+  validated before it replaces anything. A payload that fails to parse, or that
+  is missing the providers we price against, is refused and the previous
+  snapshot stays in force. Set `ORAMA_CATALOG_REFRESH=0` to disable the fetch
+  entirely; a snapshot embedded in the binary keeps pricing working offline.
 - Anything requiring an attacker who already has local code execution or read
   access to your home directory.
 

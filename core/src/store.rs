@@ -59,18 +59,40 @@ pub fn redact_headers(headers: &Value) -> Value {
     out
 }
 
+/// Work for the single writer task.
+///
+/// Re-pricing goes through the same channel as capture rather than opening a
+/// second connection: SQLite gets exactly one writer, and a catalogue refresh
+/// queues behind in-flight captures instead of racing them.
+enum WriterMsg {
+    Record(Box<CallRecord>),
+    Reprice,
+}
+
 /// Handle used by the request path to enqueue records for persistence.
 #[derive(Clone)]
 pub struct StoreHandle {
-    tx: mpsc::UnboundedSender<CallRecord>,
+    tx: mpsc::UnboundedSender<WriterMsg>,
 }
 
 impl StoreHandle {
     /// Enqueue a finished record. Best-effort: a closed channel is logged to
     /// stderr and dropped, never propagated to the client.
     pub fn record(&self, record: CallRecord) {
-        if let Err(err) = self.tx.send(record) {
-            eprintln!("orama: failed to enqueue call record: {err}");
+        self.send(WriterMsg::Record(Box::new(record)), "call record");
+    }
+
+    /// Ask the writer to re-price the derived generations.
+    ///
+    /// Called when a catalogue refresh changes the rates under rows that were
+    /// already priced.
+    pub fn reprice(&self) {
+        self.send(WriterMsg::Reprice, "reprice request");
+    }
+
+    fn send(&self, message: WriterMsg, what: &str) {
+        if let Err(err) = self.tx.send(message) {
+            eprintln!("orama: failed to enqueue {what}: {err}");
         }
     }
 }
@@ -80,6 +102,12 @@ impl StoreHandle {
 pub fn spawn_writer(path: impl AsRef<Path>) -> anyhow::Result<StoreHandle> {
     let conn = rusqlite::Connection::open(path)?;
     apply_schema(&conn)?;
+
+    // Rates have to be in force before anything is derived or re-priced, and
+    // this is offline: the cached snapshot if there is one, the embedded seed
+    // otherwise. The network refresh comes later and separately, so a machine
+    // with no connectivity still prices.
+    crate::catalog::ensure_loaded(&conn);
 
     // Bring the derived layer up to the running parser before serving anything.
     // Without this an upgraded binary reads a database derived by an older
@@ -99,22 +127,31 @@ pub fn spawn_writer(path: impl AsRef<Path>) -> anyhow::Result<StoreHandle> {
         Err(err) => eprintln!("orama: could not bring the derived layer up to date: {err}"),
     }
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<CallRecord>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<WriterMsg>();
 
     // The writer task owns the connection for its entire lifetime.
     tokio::task::spawn_blocking(move || {
-        while let Some(record) = rx.blocking_recv() {
-            match insert(&conn, &record) {
-                Ok(id) => {
-                    // The raw row is already durable, so derivation runs second
-                    // and its failures are recorded rather than propagated.
-                    // Deriving from the in-memory record matches deriving from
-                    // the stored row: redaction only touches auth headers, which
-                    // the derived layer never reads.
-                    let stored = StoredCall { id, record };
-                    crate::derive::write::derive_live(&conn, &stored);
-                }
-                Err(err) => eprintln!("orama: failed to persist call record: {err}"),
+        while let Some(message) = rx.blocking_recv() {
+            match message {
+                WriterMsg::Record(record) => match insert(&conn, &record) {
+                    Ok(id) => {
+                        // The raw row is already durable, so derivation runs second
+                        // and its failures are recorded rather than propagated.
+                        // Deriving from the in-memory record matches deriving from
+                        // the stored row: redaction only touches auth headers, which
+                        // the derived layer never reads.
+                        let stored = StoredCall {
+                            id,
+                            record: *record,
+                        };
+                        crate::derive::write::derive_live(&conn, &stored);
+                    }
+                    Err(err) => eprintln!("orama: failed to persist call record: {err}"),
+                },
+                WriterMsg::Reprice => match crate::derive::write::reprice(&conn) {
+                    Ok(updated) => eprintln!("orama: re-priced {updated} generation(s)"),
+                    Err(err) => eprintln!("orama: could not re-price generations: {err}"),
+                },
             }
         }
     });
@@ -194,7 +231,30 @@ const MIGRATIONS: &[Migration] = &[
         column: "tools_chars",
         ddl: "ALTER TABLE generations ADD COLUMN tools_chars INTEGER",
     },
+    // v7 — the cached model catalogue.
+    Migration::Sql(CATALOG_SCHEMA_V7),
 ];
+
+/// The model catalogue, cached from models.dev.
+///
+/// The odd one out in this schema: it is neither a raw capture nor a function of
+/// one, but a copy of an external document. Exactly one row is kept — the
+/// snapshot in force — because nothing derives from a superseded catalogue, and
+/// keeping old payloads would only invite pricing a call against a version
+/// nobody chose. `digest` is what pricing stamps onto the rows it prices, so any
+/// generation can be traced back to the rates that produced it.
+const CATALOG_SCHEMA_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS model_catalog (
+    digest      TEXT PRIMARY KEY,
+    etag        TEXT,
+    -- When this payload was downloaded.
+    fetched_at  TEXT NOT NULL,
+    -- When it was last confirmed current; a 304 moves this and not fetched_at.
+    checked_at  TEXT NOT NULL,
+    -- gzipped models.dev api.json.
+    payload     BLOB NOT NULL
+);
+"#;
 
 /// Alert storage. Derived like everything else, so a policy change rebuilds it.
 ///

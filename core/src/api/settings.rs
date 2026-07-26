@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::connect::{self, Harness};
 use crate::derive::PARSER_VERSION;
 use crate::detect::POLICY_VERSION;
-use crate::pricing::PRICING_VERSION;
+use crate::pricing::pricing_version;
 
 use super::ReadStore;
 
@@ -40,6 +40,10 @@ pub struct SettingsState {
     pub capturing: bool,
     pub started_at: String,
     pub store: ReadStore,
+    /// The single writer, when capture is on. Needed because a catalogue
+    /// refresh has to re-price, and re-pricing is a write — which goes through
+    /// the one task that owns the connection, never a second one.
+    pub writer: Option<crate::store::StoreHandle>,
 }
 
 pub fn routes(state: SettingsState) -> Router {
@@ -50,7 +54,42 @@ pub fn routes(state: SettingsState) -> Router {
             "/api/v2/connectors/:id/disconnect",
             post(disconnect_handler),
         )
+        .route("/api/v2/catalog/refresh", post(refresh_catalog))
         .with_state(state)
+}
+
+/// POST /api/v2/catalog/refresh — fetch the published rates now.
+///
+/// The daily background check is the normal path; this exists because "my
+/// prices look stale" should be answerable without restarting the proxy.
+async fn refresh_catalog(State(state): State<SettingsState>) -> Response {
+    if !crate::catalog::fetch::refresh_enabled() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "catalogue refresh is disabled by ORAMA_CATALOG_REFRESH" })),
+        )
+            .into_response();
+    }
+
+    match crate::catalog::fetch::refresh(&state.config.db_path).await {
+        Ok(outcome) => {
+            let changed = matches!(outcome, crate::catalog::fetch::Refreshed::Installed { .. });
+            // Rates that moved leave every priced row disagreeing with them, so
+            // the re-price is part of the refresh rather than a later surprise.
+            if changed {
+                if let Some(writer) = &state.writer {
+                    writer.reprice();
+                }
+            }
+            Json(json!({ "changed": changed, "catalog": crate::api::v2::catalog_meta() }))
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("could not reach models.dev: {err}") })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/v2/settings — everything the settings screen renders.
@@ -80,8 +119,9 @@ fn proxy_state(state: &SettingsState) -> Value {
         "started_at": state.started_at,
         "last_capture_at": last_capture,
         "parser_version": PARSER_VERSION,
-        "pricing_version": PRICING_VERSION,
+        "pricing_version": pricing_version(),
         "policy_version": POLICY_VERSION,
+        "catalog": crate::api::v2::catalog_meta(),
     })
 }
 

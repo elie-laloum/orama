@@ -5,6 +5,7 @@
 //! binary wrapper.
 
 pub mod api;
+pub mod catalog;
 pub mod config;
 pub mod connect;
 pub mod derive;

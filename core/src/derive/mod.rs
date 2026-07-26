@@ -567,7 +567,13 @@ fn cost(row: &mut GenerationRow) {
         cache_creation_1h: row.cache_creation_1h_tokens,
         cache_creation_total: row.cache_creation_tokens,
     };
-    let Some(cost) = crate::pricing::price(model, &row.started_at, &tokens) else {
+    // Record which rates were consulted even when they yielded nothing. The
+    // cost columns staying NULL is what "unpriced" means; the version says the
+    // row was considered, which is what lets a later refresh find the rows that
+    // were unknown under the old catalogue and are known under the new one.
+    row.pricing_version = Some(crate::pricing::pricing_version());
+
+    let Some(cost) = crate::pricing::price(&row.provider, model, &row.started_at, &tokens) else {
         return;
     };
     row.cost_input_usd = Some(cost.input_usd);
@@ -576,8 +582,7 @@ fn cost(row: &mut GenerationRow) {
     row.cost_cache_read_usd = Some(cost.cache_read_usd);
     row.cost_total_usd = Some(cost.total_usd);
     row.cost_uncached_equiv_usd = Some(cost.uncached_equivalent_usd);
-    row.pricing_model_id = Some(cost.model_id.to_owned());
-    row.pricing_version = Some(crate::pricing::PRICING_VERSION.to_owned());
+    row.pricing_model_id = Some(cost.model_id.clone());
 }
 
 /// Tool invocations observed in this call, paired with their results.

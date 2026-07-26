@@ -498,9 +498,10 @@ const RULES: &[Rule] = &[
         category: "data_quality",
         confidence: "unavailable",
         title: "Model is not priced",
-        explanation: "This model is absent from the pricing table.",
+        explanation: "No published rates for this model in the model catalogue.",
         impact: "Its spend is missing from every cost total.",
-        recommendation: "Add the model's rates to the pricing table.",
+        recommendation: "Refresh the catalogue from Settings. If it is still missing, \
+                         models.dev does not publish rates for this model yet.",
         sql: r#"
             SELECT 'info', 'call', span_id, call_id, span_id, trace_id, session_id,
                    'No rates are known for `' || model || '`.',

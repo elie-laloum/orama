@@ -28,7 +28,7 @@ use crate::{
         model::{BlockKind, NormalizedCall},
         parse_call,
     },
-    pricing::PRICING_VERSION,
+    pricing::pricing_version,
     store::get_call,
 };
 
@@ -69,8 +69,136 @@ pub fn routes() -> Router<ReadStore> {
         .route("/api/v2/tools", get(tools))
         .route("/api/v2/tools/:name", get(tool))
         .route("/api/v2/cost", get(cost))
+        .route("/api/v2/models", get(models))
         .route("/api/v2/policy", get(policy))
         .route("/api/v2/events", get(super::events::stream))
+}
+
+// ── model catalogue ──────────────────────────────────────────────────────
+
+/// Provenance of the rates in force.
+pub(crate) fn catalog_meta() -> Value {
+    match crate::catalog::current() {
+        Some(catalog) => json!({
+            "digest": catalog.snapshot.digest,
+            "source": catalog.snapshot.source.as_str(),
+            "fetched_at": catalog.snapshot.fetched_at,
+            "checked_at": catalog.snapshot.checked_at,
+            "providers": catalog.provider_count(),
+            "models": catalog.model_count(),
+        }),
+        // No catalogue means nothing is priced. Saying so beats an empty object
+        // that reads like a catalogue with no models in it.
+        None => Value::Null,
+    }
+}
+
+/// Models this capture actually used, enriched from the catalogue.
+///
+/// The observed side is SQL; the catalogue side is the in-memory snapshot. It is
+/// joined here rather than in the query because the catalogue is not a derived
+/// table — it is a copy of an external document, and projecting 5,756 rows into
+/// SQLite to serve a screen that lists four of them would be a second copy to
+/// keep in sync for no gain.
+///
+/// Everything the catalogue does not know stays `null` while the observed
+/// counts survive: a model absent upstream is unpriced, not unused.
+async fn models(State(store): State<ReadStore>) -> Response {
+    let sql = r#"
+        SELECT provider,
+               model,
+               COALESCE(pricing_model_id, model)                       AS priced_as,
+               COUNT(*)                                                AS generations,
+               SUM(input_tokens)                                       AS input_tokens,
+               SUM(output_tokens)                                      AS output_tokens,
+               SUM(cache_read_tokens)                                  AS cache_read_tokens,
+               SUM(cache_creation_tokens)                              AS cache_creation_tokens,
+               SUM(cost_total_usd)                                     AS cost_total_usd,
+               MAX(COALESCE(input_tokens, 0) + COALESCE(cache_read_tokens, 0)
+                   + COALESCE(cache_creation_tokens, 0))               AS peak_context_tokens,
+               MIN(started_at)                                         AS first_seen,
+               MAX(started_at)                                         AS last_seen,
+               CAST(SUM(cost_total_usd IS NOT NULL) AS REAL) / COUNT(*) AS priced_share
+          FROM generations
+         WHERE model IS NOT NULL
+         GROUP BY provider, model
+         ORDER BY COALESCE(cost_total_usd, 0) DESC
+    "#;
+
+    let mut rows = match query(&store, sql, &[]) {
+        Ok(rows) => rows,
+        Err(err) => return db_error(err),
+    };
+
+    let catalog = crate::catalog::current();
+    for row in &mut rows {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let provider = object
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        // Prefer the id pricing actually resolved to, so the rates shown are the
+        // rates that were charged rather than a second, independent lookup that
+        // could disagree with them.
+        let model = object
+            .get("priced_as")
+            .or_else(|| object.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        let record = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.resolve(&provider, &model));
+        let Some(record) = record else {
+            object.insert("in_catalog".into(), json!(false));
+            continue;
+        };
+
+        let rates = record.pricing.as_ref().map(|pricing| &pricing.base);
+        object.insert("in_catalog".into(), json!(true));
+        object.insert("name".into(), json!(record.name));
+        object.insert("family".into(), json!(record.family));
+        object.insert("description".into(), json!(record.description));
+        object.insert("status".into(), json!(record.status));
+        object.insert("release_date".into(), json!(record.release_date));
+        object.insert("knowledge".into(), json!(record.knowledge));
+        object.insert("context_limit".into(), json!(record.limits.context));
+        object.insert("output_limit".into(), json!(record.limits.output));
+        object.insert("rate_input".into(), json!(rates.map(|r| r.input)));
+        object.insert("rate_output".into(), json!(rates.map(|r| r.output)));
+        object.insert(
+            "rate_cache_read".into(),
+            json!(rates.and_then(|r| r.cache_read)),
+        );
+        object.insert(
+            "rate_cache_write".into(),
+            json!(rates.and_then(|r| r.cache_write)),
+        );
+        object.insert(
+            "tiered".into(),
+            json!(record
+                .pricing
+                .as_ref()
+                .is_some_and(|pricing| !pricing.tiers.is_empty())),
+        );
+        object.insert("reasoning".into(), json!(record.capabilities.reasoning));
+        object.insert("tool_call".into(), json!(record.capabilities.tool_call));
+        object.insert(
+            "structured_output".into(),
+            json!(record.capabilities.structured_output),
+        );
+        object.insert("attachment".into(), json!(record.capabilities.attachment));
+        object.insert(
+            "input_modalities".into(),
+            json!(record.capabilities.input_modalities),
+        );
+    }
+
+    Json(json!({ "catalog": catalog_meta(), "models": rows })).into_response()
 }
 
 // ── row serialization ────────────────────────────────────────────────────
@@ -243,11 +371,14 @@ async fn meta(State(store): State<ReadStore>) -> Response {
             let mut counts = rows.remove(0);
             if let Some(object) = counts.as_object_mut() {
                 object.insert("parser_version".into(), json!(PARSER_VERSION));
-                object.insert("pricing_version".into(), json!(PRICING_VERSION));
+                object.insert("pricing_version".into(), json!(pricing_version()));
                 object.insert(
                     "policy_version".into(),
                     json!(SignalPolicy::default().version),
                 );
+                // Where the prices came from, so any screen showing a cost can
+                // say what it was priced against.
+                object.insert("catalog".into(), catalog_meta());
             }
             Json(counts).into_response()
         }

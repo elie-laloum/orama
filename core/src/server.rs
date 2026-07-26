@@ -24,6 +24,7 @@ use crate::util::now_rfc3339;
 /// to enable capture; `None` gives a pure pass-through proxy.
 pub fn router(config: Config, store: Option<StoreHandle>) -> Router {
     let capturing = store.is_some();
+    let writer = store.clone();
     let state = RelayState::with_store(&config, store);
     let read_store = ReadStore::new(config.db_path.clone());
 
@@ -32,6 +33,7 @@ pub fn router(config: Config, store: Option<StoreHandle>) -> Router {
         capturing,
         started_at: now_rfc3339(),
         store: read_store.clone(),
+        writer,
     };
 
     // The relay/health routes carry RelayState; finalise that state before
@@ -80,6 +82,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             None
         }
     };
+
+    // Check for newer published rates in the background. Spawned rather than
+    // awaited: whether models.dev is reachable has no bearing on whether this
+    // proxy can relay traffic, and startup must not wait on it. A snapshot is
+    // already in force by now, loaded offline by `spawn_writer`.
+    if let Some(handle) = store.clone() {
+        let db_path = effective.db_path.clone();
+        crate::catalog::fetch::spawn_refresh(db_path, move || handle.reprice());
+    }
 
     println!("Orama proxy listening on {local}");
     println!("upstream (anthropic): {}", effective.upstream);

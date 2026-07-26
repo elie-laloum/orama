@@ -13,6 +13,12 @@ use crate::util::now_rfc3339;
 /// Key under which the parser version that produced the derived tables is kept.
 const META_PARSER_VERSION: &str = "parser_version";
 
+/// Key under which the rates the cost columns were computed at are kept.
+///
+/// Distinct from the parser version because it moves for a different reason and
+/// costs far less to fix — see [`rebuild_if_stale`].
+const META_PRICING_VERSION: &str = "pricing_version";
+
 /// What a backfill pass did, for reporting to the operator.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackfillReport {
@@ -315,6 +321,13 @@ pub fn derive_and_write(conn: &Connection, call: &StoredCall) -> Option<String> 
     if !super::is_inference_call(call) {
         return None;
     }
+    // Every path that derives arrives here — live capture, backfill, rebuild,
+    // and the `derive` command — so this is where rates are guaranteed to be in
+    // force. `derive_one` is pure and takes no connection, and without this a
+    // caller that never opened a server would silently derive everything
+    // unpriced. After the first call it is one atomic read.
+    crate::catalog::ensure_loaded(conn);
+
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| derive_one(call)));
     match outcome {
         Ok(derived) => {
@@ -421,7 +434,119 @@ pub fn backfill(conn: &Connection) -> Result<BackfillReport> {
     // are recomputed wholesale once everything else is in place.
     crate::detect::evaluate(conn, &crate::detect::SignalPolicy::default())?;
     set_meta(conn, META_PARSER_VERSION, PARSER_VERSION)?;
+    set_meta(
+        conn,
+        META_PRICING_VERSION,
+        &crate::pricing::pricing_version(),
+    )?;
     Ok(report)
+}
+
+/// Re-price every derived generation at the rates now in force.
+///
+/// Cost is the one derived field that can go stale without any capture changing:
+/// rates live in a catalogue that refreshes on its own. Everything pricing needs
+/// — provider, model, capture time, every token counter — is already a column on
+/// `generations`, so this is a read and an update. It deliberately does not
+/// re-parse the raw bodies: request bodies are the bulk of the database, and a
+/// price change is no reason to read them again.
+///
+/// Returns how many rows changed hands, priced or unpriced.
+pub fn reprice(conn: &Connection) -> Result<usize> {
+    crate::catalog::ensure_loaded(conn);
+
+    struct Row {
+        id: i64,
+        provider: String,
+        model: Option<String>,
+        started_at: String,
+        tokens: crate::pricing::Tokens,
+    }
+
+    let rows: Vec<Row> = {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, provider, COALESCE(model_resolved, model), started_at,
+                   input_tokens, output_tokens, cache_read_tokens,
+                   cache_creation_5m_tokens, cache_creation_1h_tokens, cache_creation_tokens
+              FROM generations
+            "#,
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok(Row {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                started_at: row.get(3)?,
+                tokens: crate::pricing::Tokens {
+                    input: row.get(4)?,
+                    output: row.get(5)?,
+                    cache_read: row.get(6)?,
+                    cache_creation_5m: row.get(7)?,
+                    cache_creation_1h: row.get(8)?,
+                    cache_creation_total: row.get(9)?,
+                },
+            })
+        })?;
+        mapped.collect::<Result<_>>()?
+    };
+
+    let version = crate::pricing::pricing_version();
+    let mut updated = 0usize;
+    {
+        let mut stmt = conn.prepare(
+            r#"
+            UPDATE generations
+               SET cost_input_usd = ?2, cost_output_usd = ?3, cost_cache_write_usd = ?4,
+                   cost_cache_read_usd = ?5, cost_total_usd = ?6,
+                   cost_uncached_equiv_usd = ?7, pricing_model_id = ?8, pricing_version = ?9
+             WHERE id = ?1
+            "#,
+        )?;
+        for row in &rows {
+            let cost = crate::pricing::price(
+                &row.provider,
+                row.model.as_deref(),
+                &row.started_at,
+                &row.tokens,
+            );
+            // An unpriceable call is written back as unpriced. Leaving a stale
+            // figure in place would be worse than reporting nothing: it would
+            // be a number nobody can reproduce.
+            match cost {
+                Some(cost) => stmt.execute(rusqlite::params![
+                    row.id,
+                    cost.input_usd,
+                    cost.output_usd,
+                    cost.cache_write_usd,
+                    cost.cache_read_usd,
+                    cost.total_usd,
+                    cost.uncached_equivalent_usd,
+                    cost.model_id,
+                    version,
+                ])?,
+                None => stmt.execute(rusqlite::params![
+                    row.id,
+                    None::<f64>,
+                    None::<f64>,
+                    None::<f64>,
+                    None::<f64>,
+                    None::<f64>,
+                    None::<f64>,
+                    None::<String>,
+                    version,
+                ])?,
+            };
+            updated += 1;
+        }
+    }
+
+    // Session totals sum generation costs, and both the cost rules and
+    // `data_quality.pricing_unknown` read them, so neither can be left behind.
+    rollup_sessions(conn, None)?;
+    crate::detect::evaluate(conn, &crate::detect::SignalPolicy::default())?;
+    set_meta(conn, META_PRICING_VERSION, &version)?;
+    Ok(updated)
 }
 
 /// Open a capture database, migrate it, and bring the derived layer up to date.
@@ -440,13 +565,35 @@ pub fn run_backfill(
     Ok(backfill(&conn)?)
 }
 
-/// Rebuild the derived layer when it was produced by a different parser.
+/// Bring the derived layer up to the running parser and the current rates.
+///
+/// Two different kinds of staleness, handled differently on purpose. A parser
+/// change means the derived rows themselves are wrong, so they are discarded and
+/// rebuilt from the captures. A price change means only the cost columns are
+/// wrong, and re-parsing every request body to fix a multiplication would be
+/// wasteful — the catalogue refreshes on its own schedule, so this happens far
+/// more often than a parser bump.
 pub fn rebuild_if_stale(conn: &Connection) -> Result<BackfillReport> {
     let stored = get_meta(conn, META_PARSER_VERSION)?;
-    if stored.as_deref() != Some(PARSER_VERSION) && stored.is_some() {
+    let parser_moved = stored.as_deref() != Some(PARSER_VERSION) && stored.is_some();
+    if parser_moved {
         clear_derived(conn)?;
     }
-    backfill(conn)
+    let report = backfill(conn)?;
+
+    // A rebuild just priced everything from scratch, so there is nothing to
+    // correct; only check the rates when the rows survived.
+    if !parser_moved {
+        let priced_at = get_meta(conn, META_PRICING_VERSION)?;
+        let current = crate::pricing::pricing_version();
+        if priced_at.as_deref() != Some(current.as_str()) && priced_at.is_some() {
+            let updated = reprice(conn)?;
+            if updated > 0 {
+                eprintln!("orama: re-priced {updated} generation(s) at {current}");
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Recompute session rollups from the derived generations.
