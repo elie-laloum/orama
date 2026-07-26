@@ -12,8 +12,13 @@ local proxy. No MITM, no certificates. One listener serves both wire dialects �
 each request is routed upstream by its own format, so Claude Code and Codex can
 be traced at the same time.
 
-Everything stays on your machine. The proxy binds to `127.0.0.1` by default and
-the only network egress is the relay to the upstream API.
+Everything stays on your machine. The proxy binds to `127.0.0.1` by default, and
+nothing it captures is ever sent anywhere. Besides relaying your traffic to the
+upstream API, it makes exactly one other request: a daily conditional fetch of
+the public model catalogue from [models.dev](https://models.dev), which is what
+prices your captures. That request sends nothing but an `If-None-Match` header
+and is usually answered with a 304. Set `ORAMA_CATALOG_REFRESH=0` to disable it —
+a snapshot ships in the binary, so pricing still works offline.
 
 ## How it works
 
@@ -63,6 +68,44 @@ stays fully available. Only the HTML dashboard degrades.
 If your toolchain is managed by mise, prefix cargo commands with
 `mise exec rust --`.
 
+### Desktop app
+
+The same proxy and dashboard, in a window, for macOS, Windows and Linux.
+Tagged releases publish installers (`.dmg`, `.msi`, `.deb`, `.AppImage`); to
+build one yourself:
+
+```bash
+npm --prefix apps/desktop install
+npm --prefix apps/desktop run build    # → target/release/bundle/
+```
+
+Linux additionally needs the system webview headers, which is why the desktop
+crate is excluded from the default workspace build — `cargo build` and
+`cargo test` stay green without them:
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev librsvg2-dev patchelf \
+  build-essential curl wget file libxdo-dev libssl-dev
+```
+
+The app runs the relay in-process on port 8787 and opens a window on its own
+`/ui`, so nothing about the dashboard is duplicated for the desktop. The
+capture database lives in `$ORAMA_HOME` (default `~/.orama`) rather than the
+working directory, because an app launched from a dock does not have a useful
+one. `ORAMA_PORT`, `ORAMA_DB`, `ORAMA_UPSTREAM` and `ORAMA_UPSTREAM_OPENAI`
+override the defaults.
+
+**Quitting stops the proxy**, so the app disconnects any harness it had
+pointed at itself before it exits — otherwise the next request from that
+harness would fail against a closed port. An agent session that is *already
+running* cannot be saved this way: both Claude Code and Codex read their
+config at startup, so a live session keeps dialling the port until it is
+restarted. If a session is mid-flight, leave the app open.
+
+If port 8787 is already serving an Orama — say you also have `orama start`
+running in a terminal — the app shows that one instead of refusing to open,
+and leaves its configuration alone on exit.
+
 ## Usage
 
 ```bash
@@ -103,21 +146,26 @@ own config file:
 | Harness | File | Change |
 | --- | --- | --- |
 | Claude Code | `~/.claude/settings.json` | sets `env.ANTHROPIC_BASE_URL` |
-| Codex | `~/.codex/config.toml` | sets `openai_base_url` |
+| Codex | `~/.codex/config.toml` | adds `model_providers.orama` and selects it |
 
-Codex gets a base-URL override rather than a custom `model_providers` entry on
-purpose. A custom provider has to declare where its credentials come from, and
-naming an `env_key` breaks the setup it was meant to trace: a Codex signed in
-through a ChatGPT plan has no API key to put in that variable and refuses to
-start. Overriding the base URL changes the destination and nothing else, so
-Codex keeps authenticating exactly as it did.
+The Codex entry sets `requires_openai_auth`, not `env_key`. That distinction is
+the whole game: `env_key` names an environment variable Codex must find, and a
+Codex signed in through a ChatGPT plan has no API key to put in one, so it
+refuses to start — breaking exactly the setup it was meant to trace.
+`requires_openai_auth` hands the request to Codex's own credentials instead, and
+a subscription then authenticates through the proxy normally.
 
-Which URL it gets depends on how Codex authenticates, because the two modes use
+It is a provider entry rather than a bare `openai_base_url` override because
+that is the only place `supports_websockets = false` can go. Codex otherwise
+opens each session by probing a WebSocket transport the proxy cannot forward,
+retries it five times, and drops to HTTP several seconds later.
+
+The base URL depends on how Codex authenticates, because the two modes are
 different backends — `chatgpt.com/backend-api/codex` for a subscription,
 `api.openai.com/v1` for an API key. The connector infers the mode from whether
-`OPENAI_API_KEY` is set and says which one it picked. Traffic finds its way back
-out by path prefix: `/backend-api/*` is relayed to the ChatGPT backend, `/v1/*`
-to the OpenAI one.
+`OPENAI_API_KEY` is set and says which it picked. Traffic finds its way back out
+by path prefix: `/backend-api/*` is relayed to the ChatGPT backend, `/v1/*` to
+the OpenAI one.
 
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honoured, so a relocated config
 directory is edited where the harness will actually read it. The original file
@@ -221,10 +269,13 @@ Cargo workspace plus a frontend app:
 
 - `core/` — the library: config, relay, streaming tee, SSE reconstruction,
   SQLite store, provider parsing/normalization, signals and diagnostics,
-  read-only API. A future Tauri shell can depend on this directly.
+  read-only API. Both front ends are thin wrappers over it.
 - `cli/` — thin `orama` binary.
-- `apps/web/` — React + TypeScript dashboard (Rspack), embedded into the binary
+- `apps/web/` — React + TypeScript dashboard (Vite), embedded into the binary
   at build time.
+- `apps/desktop/` — Tauri shell for macOS, Windows and Linux. Runs the same
+  server in-process and opens a window on its `/ui`, so there is one dashboard,
+  not two.
 
 ## Development
 
