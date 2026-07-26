@@ -3,7 +3,12 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import { X } from "lucide-react";
 
-import { api, type Generation } from "@/api/client";
+import {
+  api,
+  type CallContext,
+  type ContextTurn,
+  type Generation,
+} from "@/api/client";
 import {
   AgentPill,
   ConfidenceBadge,
@@ -27,6 +32,7 @@ import {
   modelLabel,
   ms,
   num,
+  percent,
   truncate,
   usd,
 } from "@/domain/format";
@@ -204,10 +210,10 @@ function Outcome({ row }: { row: Generation }) {
 
 /* ── detail pane ──────────────────────────────────────────────────────── */
 
-const TABS = ["Conversation", "Tools", "Findings", "Raw"] as const;
+const TABS = ["Summary", "Context", "Tools", "Findings", "Raw"] as const;
 
 function GenerationDetail({ span, onClose }: { span: string; onClose: () => void }) {
-  const [tab, setTab] = React.useState<(typeof TABS)[number]>("Conversation");
+  const [tab, setTab] = React.useState<(typeof TABS)[number]>("Summary");
   const detail = useQuery({
     queryKey: ["generation", span],
     queryFn: () => api.generation(span),
@@ -217,6 +223,12 @@ function GenerationDetail({ span, onClose }: { span: string; onClose: () => void
     queryKey: ["generation-raw", span],
     queryFn: () => api.generationRaw(span),
     enabled: tab === "Raw",
+  });
+  // Likewise the context view, which re-parses the capture to outline its thread.
+  const context = useQuery({
+    queryKey: ["generation-context", span],
+    queryFn: () => api.generationContext(span),
+    enabled: tab === "Context",
   });
 
   return (
@@ -260,8 +272,16 @@ function GenerationDetail({ span, onClose }: { span: string; onClose: () => void
           <Loading />
         ) : detail.error ? (
           <Failed error={detail.error} />
-        ) : !detail.data ? null : tab === "Conversation" ? (
+        ) : !detail.data ? null : tab === "Summary" ? (
           <Facts generation={detail.data.generation} />
+        ) : tab === "Context" ? (
+          context.isLoading ? (
+            <Loading />
+          ) : context.error ? (
+            <Failed error={context.error} />
+          ) : context.data ? (
+            <ContextView context={context.data} />
+          ) : null
         ) : tab === "Tools" ? (
           <ToolList tools={detail.data.tool_calls} />
         ) : tab === "Findings" ? (
@@ -308,6 +328,228 @@ function Facts({ generation }: { generation: Generation }) {
       ))}
     </dl>
   );
+}
+
+/* ── context ──────────────────────────────────────────────────────────── */
+
+/**
+ * What this one call actually put in front of the model.
+ *
+ * Laid out in send order — system prompt, tool declarations, then the thread —
+ * because that is the order the model reads it in, and because the first two
+ * being larger than the third is invisible from every other view.
+ */
+function ContextView({ context }: { context: CallContext }) {
+  const { composition, system, tools, thread } = context;
+  const total = composition.total_chars;
+  const share = (value: number) => (total > 0 ? value / total : null);
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-sm border border-border bg-raised p-2">
+        <div className="flex items-center justify-between text-2xs text-faint">
+          <span>Request composition</span>
+          <span className="tnum">{compact(total)} chars</span>
+        </div>
+        <div className="mt-1.5 flex h-2.5 overflow-hidden rounded-xs">
+          {[
+            ["bg-accent", composition.system_chars, "system prompt"],
+            ["bg-warn", composition.tools_chars, "tool declarations"],
+            ["bg-ok", composition.history_chars, "conversation"],
+          ].map(([cls, value, label]) =>
+            (value as number) > 0 ? (
+              <div
+                key={label as string}
+                className={cls as string}
+                style={{ width: `${(share(value as number) ?? 0) * 100}%` }}
+                title={`${label}: ${compact(value as number)} chars`}
+              />
+            ) : null,
+          )}
+        </div>
+        <dl className="mt-2 space-y-0.5 text-2xs">
+          <Row
+            label="System prompt"
+            value={`${compact(composition.system_chars)} · ${percent(share(composition.system_chars))}`}
+            detail={
+              system
+                ? `${system.segment_count} segments, ${system.cache_points} cache point${system.cache_points === 1 ? "" : "s"}`
+                : "none declared"
+            }
+          />
+          <Row
+            label="Tool declarations"
+            value={`${compact(composition.tools_chars)} · ${percent(share(composition.tools_chars))}`}
+            detail={`${tools.length} tool${tools.length === 1 ? "" : "s"}`}
+          />
+          <Row
+            label="Conversation"
+            value={`${compact(composition.history_chars)} · ${percent(share(composition.history_chars))}`}
+            detail={`${thread.turns.length} turns`}
+          />
+        </dl>
+      </div>
+
+      {/* Which kinds of block make up the thread, before reading any of it. */}
+      {thread.by_kind.length > 0 && (
+        <Section title="Thread by block kind">
+          <ul className="space-y-0.5">
+            {thread.by_kind.map((kind) => (
+              <li key={kind.kind} className="flex items-center gap-2 text-2xs">
+                <span className="w-24 shrink-0 font-mono text-faint">{kind.kind}</span>
+                <span className="text-muted tnum">{kind.count}×</span>
+                <span className="ml-auto text-muted tnum">
+                  {compact(kind.chars)} ch
+                </span>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+
+      {system && system.segments.length > 0 && (
+        <Section title="System prompt">
+          <ul className="space-y-1.5">
+            {system.segments.map((segment, index) => (
+              <li key={index}>
+                <div className="flex items-center gap-2 text-2xs text-faint">
+                  <span>segment {index + 1}</span>
+                  {segment.cache_control && <Pill tone="ok">cached</Pill>}
+                  <span className="ml-auto tnum">{compact(segment.chars)} ch</span>
+                </div>
+                <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words font-mono text-2xs text-muted">
+                  {segment.text}
+                </pre>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+
+      {tools.length > 0 && (
+        <Section title={`Tools declared (${tools.length}, heaviest first)`}>
+          <ul className="space-y-0.5">
+            {tools.map((tool) => (
+              <li key={tool.name} className="flex items-center gap-2 text-2xs">
+                <span className="truncate font-mono">{tool.name}</span>
+                {tool.is_mcp ? <Pill>mcp</Pill> : null}
+                <span className="ml-auto shrink-0 text-faint tnum">
+                  {compact(tool.chars)} ch
+                </span>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+
+      <Section title="Message thread">
+        <ol className="space-y-1.5">
+          {thread.turns.map((turn) => (
+            <ContextTurnRow key={turn.index} turn={turn} />
+          ))}
+        </ol>
+      </Section>
+    </div>
+  );
+}
+
+function Row({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+}) {
+  return (
+    <div className="flex gap-2">
+      <dt className="w-32 shrink-0 text-faint">{label}</dt>
+      <dd className="tnum text-muted">{value}</dd>
+      <dd className="ml-auto text-faint">{detail}</dd>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-sm border border-border bg-raised p-2">
+      <div className="mb-1.5 text-2xs uppercase tracking-wider text-faint">
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function ContextTurnRow({ turn }: { turn: ContextTurn }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <li className="rounded-sm border border-border/60">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center gap-2 px-2 py-1 text-left text-2xs"
+      >
+        <span className="w-4 shrink-0 text-faint tnum">{turn.index}</span>
+        <RolePill role={turn.role} />
+        {turn.origin === "new" && (
+          <Pill tone="ok" title="Sent by this call rather than replayed history">
+            new
+          </Pill>
+        )}
+        <span className="truncate text-faint">
+          {turn.blocks.map((block) => block.kind).join(", ")}
+        </span>
+        <span className="ml-auto shrink-0 text-muted tnum">
+          {compact(turn.chars)} ch
+        </span>
+      </button>
+      {open && (
+        <div className="space-y-1.5 border-t border-border/60 p-2">
+          {turn.blocks.map((block, index) => (
+            <div key={index}>
+              <div className="flex items-center gap-1.5 text-2xs text-faint">
+                <span className="font-mono">{block.kind}</span>
+                {block.tool_name && <Pill>{block.tool_name}</Pill>}
+                {/* Injected content is not the user speaking, and saying so is
+                    the difference between reading a prompt and misreading it. */}
+                {block.content_tag && (
+                  <Pill tone="warn" title="Injected by the harness, not written by the user">
+                    {block.content_tag.replace(/_/g, " ")}
+                  </Pill>
+                )}
+                {block.is_error && <Pill tone="error">error</Pill>}
+                <span className="ml-auto tnum">{compact(block.chars)} ch</span>
+              </div>
+              {block.preview && (
+                <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-2xs text-muted">
+                  {block.preview}
+                </pre>
+              )}
+              {block.truncated && (
+                <div className="text-2xs text-faint">
+                  Preview only — see Raw for the full block.
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </li>
+  );
+}
+
+const ROLE_TONE: Record<string, "ok" | "warn" | "unknown" | undefined> = {
+  user: undefined,
+  assistant: undefined,
+  // An inline system turn is harness-injected instruction, not conversation.
+  system: "warn",
+  tool: undefined,
+  other: "unknown",
+};
+
+function RolePill({ role }: { role: string }) {
+  return <Pill tone={ROLE_TONE[role]}>{role}</Pill>;
 }
 
 function ToolList({ tools }: { tools: Awaited<ReturnType<typeof api.generation>>["tool_calls"] }) {

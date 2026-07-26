@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   ListTree,
   MessagesSquare,
+  ScrollText,
   Wrench,
 } from "lucide-react";
 
@@ -28,6 +29,7 @@ const NAV: {
   { to: "/sessions", label: "Sessions", icon: MessagesSquare },
   { to: "/errors", label: "Errors", icon: AlertTriangle },
   { to: "/tools", label: "Tools", icon: Wrench },
+  { to: "/harness", label: "Harness", icon: ScrollText },
   { to: "/cost", label: "Cost", icon: DollarSign },
 ];
 

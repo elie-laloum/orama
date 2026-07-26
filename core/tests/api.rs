@@ -4,7 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use axum::Router;
+use axum::{http::StatusCode, Router};
 use orama_core::{
     server::router,
     store::{insert, CallRecord},

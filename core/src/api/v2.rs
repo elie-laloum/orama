@@ -21,7 +21,16 @@ use rusqlite::types::ValueRef;
 use serde_json::{json, Map, Value};
 
 use super::ReadStore;
-use crate::{derive::PARSER_VERSION, detect::SignalPolicy, pricing::PRICING_VERSION};
+use crate::{
+    derive::PARSER_VERSION,
+    detect::SignalPolicy,
+    parse::{
+        model::{BlockKind, NormalizedCall},
+        parse_call,
+    },
+    pricing::PRICING_VERSION,
+    store::get_call,
+};
 
 /// Largest page any endpoint will return, whatever the caller asks for.
 const MAX_LIMIT: i64 = 200;
@@ -36,6 +45,8 @@ const JSON_COLUMNS: &[&str] = &[
     "context_management",
     "models",
     "observed",
+    "segments",
+    "input_schema",
 ];
 
 pub fn routes() -> Router<ReadStore> {
@@ -45,6 +56,10 @@ pub fn routes() -> Router<ReadStore> {
         .route("/api/v2/generations", get(generations))
         .route("/api/v2/generations/:span", get(generation))
         .route("/api/v2/generations/:span/raw", get(generation_raw))
+        .route("/api/v2/generations/:span/context", get(generation_context))
+        .route("/api/v2/harness", get(harness))
+        .route("/api/v2/harness/system/:hash", get(harness_system))
+        .route("/api/v2/harness/tools/:hash", get(harness_tools))
         .route("/api/v2/traces", get(traces))
         .route("/api/v2/traces/:trace", get(trace))
         .route("/api/v2/sessions", get(sessions))
@@ -407,6 +422,354 @@ async fn generation_raw(State(store): State<ReadStore>, Path(span): Path<String>
         }
         Ok(_) => not_found(),
         Err(err) => db_error(err),
+    }
+}
+
+/// Longest slice of any one block returned by the context view. The whole point
+/// of the surface is to be readable, and a single tool result can be 260 KB;
+/// `/raw` remains the verbatim escape hatch, and exact sizes are always exact.
+const BLOCK_PREVIEW_CHARS: usize = 2_000;
+
+/// What one call actually put in front of the model, laid out by section.
+///
+/// The three sections are disjoint and sum to the request: the system prompt,
+/// the tool declarations, and the message thread. Only the thread is a
+/// conversation; the other two are harness overhead re-sent on every turn, and
+/// on a Claude Code main-loop call they dominate it.
+async fn generation_context(State(store): State<ReadStore>, Path(span): Path<String>) -> Response {
+    let shape = query(
+        &store,
+        r#"
+        SELECT call_id, span_id, session_id, agent_name, agent_role, model,
+               started_at, system_hash, system_chars, system_segments_count,
+               system_cache_points, tools_hash, tools_chars, tools_declared_count,
+               messages_count, context_chars, block_counts, compaction_requested,
+               context_management, thinking_mode, thinking_budget, max_tokens,
+               input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens
+          FROM generations WHERE span_id = ?1 OR call_id = ?1
+        "#,
+        &[&span],
+    );
+    let shape = match shape {
+        Ok(mut rows) if !rows.is_empty() => rows.remove(0),
+        Ok(_) => return not_found(),
+        Err(err) => return db_error(err),
+    };
+    let Some(call_id) = shape.get("call_id").and_then(Value::as_i64) else {
+        return not_found();
+    };
+
+    let system_hash = shape.get("system_hash").and_then(Value::as_str);
+    let system = match system_hash {
+        Some(hash) => match query(
+            &store,
+            "SELECT segments, total_chars, segment_count, cache_points FROM system_prompts WHERE system_hash = ?1",
+            &[&hash],
+        ) {
+            Ok(mut rows) if !rows.is_empty() => rows.remove(0),
+            Ok(_) => Value::Null,
+            Err(err) => return db_error(err),
+        },
+        None => Value::Null,
+    };
+
+    let tools_hash = shape.get("tools_hash").and_then(Value::as_str);
+    let tools = match tools_hash {
+        Some(hash) => match query(
+            &store,
+            r#"
+            SELECT name, server, is_mcp, chars,
+                   substr(description, 1, 240) AS description_head
+              FROM tool_schemas WHERE tools_hash = ?1 ORDER BY chars DESC
+            "#,
+            &[&hash],
+        ) {
+            Ok(rows) => Value::Array(rows),
+            Err(err) => return db_error(err),
+        },
+        None => Value::Array(Vec::new()),
+    };
+
+    // The thread has no derived table — it is the one part of a request that is
+    // different on every call, so materializing it would copy the whole corpus.
+    // Parsing one capture on demand is what `/raw` already does.
+    let thread = {
+        let conn = match store.open() {
+            Ok(conn) => conn,
+            Err(err) => return db_error(err),
+        };
+        match get_call(&conn, call_id) {
+            Ok(Some(call)) => thread_outline(&parse_call(&call)),
+            Ok(None) => return not_found(),
+            Err(err) => return db_error(err),
+        }
+    };
+
+    let number = |key: &str| shape.get(key).and_then(Value::as_i64).unwrap_or_default();
+    Json(json!({
+        "shape": shape,
+        "composition": {
+            "system_chars": number("system_chars"),
+            "tools_chars": number("tools_chars"),
+            "history_chars": number("context_chars"),
+            "total_chars": number("system_chars") + number("tools_chars") + number("context_chars"),
+        },
+        "system": system,
+        "tools": tools,
+        "thread": thread,
+    }))
+    .into_response()
+}
+
+/// The message thread as a list of blocks: what each one is, how big, and
+/// enough of its text to recognize it.
+fn thread_outline(normalized: &NormalizedCall) -> Value {
+    let turns: Vec<Value> = normalized
+        .thread
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            let blocks: Vec<Value> = turn
+                .blocks
+                .iter()
+                .map(|block| {
+                    json!({
+                        "kind": block.kind,
+                        // The tag is what separates the human's words from the
+                        // reminders and command output the harness injects into
+                        // user turns — indistinguishable without it.
+                        "content_tag": block.content_tag,
+                        "chars": block.approx_size.chars,
+                        "tool_name": block.tool_name,
+                        "is_error": block.is_error,
+                        "preview": block.content.as_deref().map(|text| {
+                            crate::derive::extract::excerpt(text, BLOCK_PREVIEW_CHARS)
+                        }).or_else(|| {
+                            // A tool_use block carries its arguments rather than
+                            // text; showing nothing would misreport it as empty.
+                            block.input.as_ref().map(|input| {
+                                crate::derive::extract::excerpt(
+                                    &input.to_string(), BLOCK_PREVIEW_CHARS)
+                            })
+                        }),
+                        "truncated": block.approx_size.chars > BLOCK_PREVIEW_CHARS,
+                    })
+                })
+                .collect();
+            json!({
+                "index": index,
+                "role": turn.role,
+                "origin": turn.origin,
+                "chars": turn.blocks.iter().map(|b| b.approx_size.chars).sum::<usize>(),
+                "blocks": blocks,
+            })
+        })
+        .collect();
+
+    // A per-kind roll-up over the thread, so the shape of the history is legible
+    // before reading any of it.
+    let mut by_kind: HashMap<String, (usize, usize)> = HashMap::new();
+    for block in normalized.thread.iter().flat_map(|turn| &turn.blocks) {
+        let name = match block.kind {
+            BlockKind::Text => "text",
+            BlockKind::Thinking => "thinking",
+            BlockKind::ToolUse => "tool_use",
+            BlockKind::ToolResult => "tool_result",
+            BlockKind::Image => "image",
+            BlockKind::Other => "other",
+        };
+        let entry = by_kind.entry(name.to_owned()).or_default();
+        entry.0 += 1;
+        entry.1 += block.approx_size.chars;
+    }
+    let mut kinds: Vec<Value> = by_kind
+        .into_iter()
+        .map(|(kind, (count, chars))| json!({ "kind": kind, "count": count, "chars": chars }))
+        .collect();
+    kinds.sort_by_key(|kind| -(kind["chars"].as_i64().unwrap_or_default()));
+
+    json!({ "turns": turns, "by_kind": kinds })
+}
+
+// ── harness ──────────────────────────────────────────────────────────────
+
+/// Every distinct harness configuration observed, and what it costs.
+///
+/// The question this answers is "what is the client actually sending?", which no
+/// other surface asks. A conversation is what the user and model said; the
+/// harness is the system prompt and the tool block wrapped around it, re-sent in
+/// full on every single call and — on a Claude Code main loop — several times
+/// larger than the conversation it carries.
+async fn harness(State(store): State<ReadStore>) -> Response {
+    // Where the characters actually go, corpus-wide. `context_chars` counts the
+    // message thread only, so the three are disjoint and sum to the request.
+    let budget = query(
+        &store,
+        r#"
+        SELECT SUM(system_chars)                       AS system_chars,
+               SUM(tools_chars)                        AS tools_chars,
+               SUM(context_chars)                      AS history_chars,
+               COUNT(*)                                AS generations,
+               SUM(tools_chars IS NOT NULL)            AS with_tools,
+               MAX(tools_chars)                        AS max_tools_chars,
+               MAX(context_chars)                      AS max_history_chars
+          FROM generations
+        "#,
+        &[],
+    );
+
+    let prompts = query(
+        &store,
+        r#"
+        SELECT p.system_hash, p.total_chars, p.segment_count, p.cache_points,
+               COUNT(g.id)                             AS generations,
+               COUNT(DISTINCT g.session_id)            AS sessions,
+               MIN(g.started_at)                       AS first_seen,
+               MAX(g.started_at)                       AS last_seen,
+               (SELECT GROUP_CONCAT(DISTINCT agent_role) FROM generations r
+                 WHERE r.system_hash = p.system_hash)  AS agent_roles,
+               (SELECT span_id FROM generations r
+                 WHERE r.system_hash = p.system_hash
+                 ORDER BY r.started_at DESC LIMIT 1)   AS latest_span,
+               -- The opening line is what makes one prompt recognizable from a
+               -- list of fingerprints, which are otherwise indistinguishable.
+               -- Claude Code's first segment is the billing header, identical in
+               -- shape across every variant, so it identifies nothing: skip past
+               -- it to the first line that is actually prompt text.
+               substr(CASE
+                 WHEN json_extract(p.segments, '$[0].text') LIKE 'x-anthropic-billing-header:%'
+                 THEN json_extract(p.segments, '$[1].text')
+                 ELSE json_extract(p.segments, '$[0].text')
+               END, 1, 120) AS opening
+          FROM system_prompts p
+          LEFT JOIN generations g ON g.system_hash = p.system_hash
+         GROUP BY p.system_hash
+         ORDER BY generations DESC
+        "#,
+        &[],
+    );
+
+    let sets = query(
+        &store,
+        r#"
+        SELECT s.tools_hash, s.tool_count, s.total_chars, s.mcp_count,
+               COUNT(g.id)                             AS generations,
+               COUNT(DISTINCT g.session_id)            AS sessions,
+               MIN(g.started_at)                       AS first_seen,
+               MAX(g.started_at)                       AS last_seen,
+               (SELECT GROUP_CONCAT(DISTINCT agent_role) FROM generations r
+                 WHERE r.tools_hash = s.tools_hash)    AS agent_roles
+          FROM tool_sets s
+          LEFT JOIN generations g ON g.tools_hash = s.tools_hash
+         GROUP BY s.tools_hash
+         ORDER BY generations DESC
+        "#,
+        &[],
+    );
+
+    // Every declared tool, ranked by what it costs against whether it earns it.
+    // A tool declared in every request and never once called is pure context
+    // spend, and this is the only place that comparison can be made.
+    let declared = query(
+        &store,
+        r#"
+        SELECT t.name,
+               MAX(t.server)                           AS server,
+               MAX(t.is_mcp)                           AS is_mcp,
+               MAX(t.chars)                            AS chars,
+               COUNT(DISTINCT t.tools_hash)            AS tool_sets,
+               (SELECT COUNT(*) FROM tool_calls c WHERE c.name = t.name) AS calls,
+               (SELECT MAX(emitted_at) FROM tool_calls c WHERE c.name = t.name) AS last_used
+          FROM tool_schemas t
+         GROUP BY t.name
+         ORDER BY calls ASC, chars DESC
+        "#,
+        &[],
+    );
+
+    match (budget, prompts, sets, declared) {
+        (Ok(mut budget), Ok(prompts), Ok(sets), Ok(declared)) => Json(json!({
+            "budget": budget.pop().unwrap_or(Value::Null),
+            "system_prompts": prompts,
+            "tool_sets": sets,
+            "declared_tools": declared,
+        }))
+        .into_response(),
+        (Err(err), ..) | (_, Err(err), ..) | (_, _, Err(err), _) | (_, _, _, Err(err)) => {
+            db_error(err)
+        }
+    }
+}
+
+/// One system prompt, verbatim, segment by segment.
+async fn harness_system(State(store): State<ReadStore>, Path(hash): Path<String>) -> Response {
+    let prompt = query(
+        &store,
+        "SELECT * FROM system_prompts WHERE system_hash = ?1",
+        &[&hash],
+    );
+    let usage = query(
+        &store,
+        r#"
+        SELECT COUNT(*) AS generations, COUNT(DISTINCT session_id) AS sessions,
+               MIN(started_at) AS first_seen, MAX(started_at) AS last_seen,
+               GROUP_CONCAT(DISTINCT agent_role) AS agent_roles,
+               GROUP_CONCAT(DISTINCT model) AS models,
+               GROUP_CONCAT(DISTINCT billing_variant) AS client_versions
+          FROM generations WHERE system_hash = ?1
+        "#,
+        &[&hash],
+    );
+    match (prompt, usage) {
+        (Ok(mut prompt), Ok(mut usage)) if !prompt.is_empty() => Json(json!({
+            "system": prompt.remove(0),
+            "usage": usage.pop().unwrap_or(Value::Null),
+        }))
+        .into_response(),
+        (Ok(_), Ok(_)) => not_found(),
+        (Err(err), _) | (_, Err(err)) => db_error(err),
+    }
+}
+
+/// One tool set: every declaration in it, with its weight and its usage.
+async fn harness_tools(State(store): State<ReadStore>, Path(hash): Path<String>) -> Response {
+    let set = query(
+        &store,
+        "SELECT * FROM tool_sets WHERE tools_hash = ?1",
+        &[&hash],
+    );
+    let tools = query(
+        &store,
+        r#"
+        SELECT t.seq, t.name, t.server, t.is_mcp, t.description, t.input_schema, t.chars,
+               (SELECT COUNT(*) FROM tool_calls c
+                 JOIN generations g ON g.call_id = c.call_id
+                WHERE c.name = t.name AND g.tools_hash = t.tools_hash) AS calls
+          FROM tool_schemas t
+         WHERE t.tools_hash = ?1
+         ORDER BY t.chars DESC
+        "#,
+        &[&hash],
+    );
+    let usage = query(
+        &store,
+        r#"
+        SELECT COUNT(*) AS generations, COUNT(DISTINCT session_id) AS sessions,
+               MIN(started_at) AS first_seen, MAX(started_at) AS last_seen,
+               GROUP_CONCAT(DISTINCT agent_role) AS agent_roles
+          FROM generations WHERE tools_hash = ?1
+        "#,
+        &[&hash],
+    );
+    match (set, tools, usage) {
+        (Ok(mut set), Ok(tools), Ok(mut usage)) if !set.is_empty() => Json(json!({
+            "tool_set": set.remove(0),
+            "tools": tools,
+            "usage": usage.pop().unwrap_or(Value::Null),
+        }))
+        .into_response(),
+        (Ok(_), Ok(_), Ok(_)) => not_found(),
+        (Err(err), ..) | (_, Err(err), _) | (_, _, Err(err)) => db_error(err),
     }
 }
 

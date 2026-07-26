@@ -103,6 +103,9 @@ pub struct GenerationRow {
     pub system_cache_points: Option<i64>,
     pub tools_hash: Option<String>,
     pub tools_declared_count: Option<i64>,
+    /// Size of the declared tool block. On a Claude Code main-loop call this is
+    /// routinely four fifths of the request, which no other counter reveals.
+    pub tools_chars: Option<i64>,
     pub messages_count: Option<i64>,
     pub context_chars: Option<i64>,
     pub history_prefix_hash: Option<String>,
@@ -142,9 +145,54 @@ pub struct ToolCallRow {
     pub duration_ms: Option<i64>,
 }
 
+/// The system prompt a request declared, kept once per distinct content.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemPromptRow {
+    pub system_hash: String,
+    /// Segments in the order sent, verbatim.
+    pub segments: Vec<SystemSegmentRow>,
+    pub total_chars: i64,
+    pub segment_count: i64,
+    pub cache_points: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemSegmentRow {
+    pub text: String,
+    pub chars: i64,
+    /// A cache breakpoint sits after this segment.
+    pub cache_control: bool,
+}
+
+/// The tool set a request declared, kept once per distinct content.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolSetRow {
+    pub tools_hash: String,
+    pub tools: Vec<ToolSchemaRow>,
+    pub tool_count: i64,
+    pub total_chars: i64,
+    pub mcp_count: i64,
+}
+
+/// One declared tool: what the model was told it can do, and what that cost.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolSchemaRow {
+    pub seq: i64,
+    pub name: String,
+    pub server: Option<String>,
+    pub is_mcp: bool,
+    pub description: Option<String>,
+    pub input_schema: Option<String>,
+    pub chars: i64,
+}
+
 /// Everything derived from one raw capture, written as a single unit.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Derived {
     pub generation: GenerationRow,
     pub tool_calls: Vec<ToolCallRow>,
+    /// Absent when the request declared no system prompt or no tools — a
+    /// sidechain or a token-count probe, which declare neither.
+    pub system_prompt: Option<SystemPromptRow>,
+    pub tool_set: Option<ToolSetRow>,
 }

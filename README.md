@@ -108,6 +108,10 @@ Strictly read-only (GET only):
 | `GET /api/calls` | Captured calls, most recent first |
 | `GET /api/calls/:id` | Full raw detail of one call |
 | `GET /api/calls/:id/normalized` | Provider-normalized conversation model |
+| `GET /api/v2/harness` | Distinct system prompts, tool sets, and where the context goes |
+| `GET /api/v2/harness/system/:hash` | One system prompt, verbatim, segment by segment |
+| `GET /api/v2/harness/tools/:hash` | One tool set: every declaration, its size, its use |
+| `GET /api/v2/generations/:span/context` | One call's context, split into system / tools / thread |
 | `GET /api/calls/:id/diagnostics` | Alerts derived for that call |
 | `GET /api/sessions` | Sessions assembled from captured calls |
 | `GET /api/sessions/:key` | One session with its call timeline |
@@ -120,6 +124,27 @@ Strictly read-only (GET only):
 | `GET /healthz` | Health probe |
 
 Every other path and method is transparently relayed upstream.
+
+### The harness view
+
+The other surfaces answer *what happened in this call*. The **Harness** surface
+answers *what was the model actually looking at*: the system prompt and the tool
+declarations wrapped around every conversation.
+
+That framing matters because the wrapper is usually bigger than the thing it
+wraps. On a real Claude Code main-loop call:
+
+```text
+system prompt      11 K chars    2.8%
+tool declarations 326 K chars   81.6%   ← 121 tools, re-sent every turn
+conversation       62 K chars   15.6%
+```
+
+Both are re-sent in full on every turn, so the surface shows each distinct
+system prompt and tool set once, keyed by a content fingerprint — a rewritten
+tool description is a different harness, and shows up as one. Per tool it
+reports the characters that declaration costs against how many times it was
+actually called, which is the only place the two can be compared.
 
 Alerts are read-only diagnostics: each carries a severity, what was observed,
 the likely cause, the impact, a suggested action, and a link back to the source

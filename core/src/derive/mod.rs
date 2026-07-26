@@ -19,11 +19,14 @@ use crate::parse::{
 };
 use crate::store::StoredCall;
 
-pub use model::{Derived, GenerationRow, ToolCallRow};
+pub use model::{
+    Derived, GenerationRow, SystemPromptRow, SystemSegmentRow, ToolCallRow, ToolSchemaRow,
+    ToolSetRow,
+};
 
 /// Bumping this invalidates every derived row and triggers a rebuild. Raw
 /// captures are never touched by the rebuild.
-pub const PARSER_VERSION: &str = "2026-07-26.1";
+pub const PARSER_VERSION: &str = "2026-07-26.2";
 
 /// Longest excerpt kept for a tool input or result. Full content stays in
 /// `calls`; derived rows exist to be scanned, not to duplicate 260 KB bodies.
@@ -75,7 +78,8 @@ pub fn derive_one(call: &StoredCall) -> Derived {
 
     identity(&mut generation, &normalized, headers, body);
     request_params(&mut generation, body);
-    system_shape(&mut generation, &normalized);
+    let system_prompt = system_shape(&mut generation, &normalized);
+    let tool_set = tool_shape(&mut generation, &normalized);
     thread_shape(&mut generation, &normalized);
     response_fields(
         &mut generation,
@@ -111,6 +115,8 @@ pub fn derive_one(call: &StoredCall) -> Derived {
     Derived {
         generation,
         tool_calls,
+        system_prompt,
+        tool_set,
     }
 }
 
@@ -180,10 +186,14 @@ fn request_params(row: &mut GenerationRow, body: Option<&Value>) {
 }
 
 /// System-prompt fingerprint plus the environment Claude Code injects into it.
-fn system_shape(row: &mut GenerationRow, normalized: &NormalizedCall) {
+///
+/// Returns the prompt itself so the caller can store it once per distinct
+/// content, which is what makes the text readable in the UI without copying it
+/// onto every one of the hundreds of calls that re-send it.
+fn system_shape(row: &mut GenerationRow, normalized: &NormalizedCall) -> Option<SystemPromptRow> {
     let segments = &normalized.system;
     if segments.is_empty() {
-        return;
+        return None;
     }
     row.billing_variant = extract::billing_variant(&segments[0].text);
 
@@ -219,17 +229,83 @@ fn system_shape(row: &mut GenerationRow, normalized: &NormalizedCall) {
         .filter(|name| !name.is_empty())
         .map(str::to_owned);
 
-    let names: Vec<&str> = normalized
-        .declared_tools
+    // The billing segment is excluded from the fingerprint but not from the
+    // stored prompt: it is what the harness actually sent, and dropping it would
+    // make the reconstructed request wrong.
+    let stored: Vec<SystemSegmentRow> = segments
         .iter()
-        .map(|tool| tool.name.as_str())
+        .map(|segment| SystemSegmentRow {
+            text: segment.text.clone(),
+            chars: segment.approx_size.chars as i64,
+            cache_control: segment.cache_control,
+        })
         .collect();
-    row.tools_declared_count = Some(names.len() as i64);
-    if !names.is_empty() {
-        let mut sorted = names;
-        sorted.sort_unstable();
-        row.tools_hash = Some(extract::fingerprint(&sorted));
+    Some(SystemPromptRow {
+        system_hash: row.system_hash.clone()?,
+        total_chars: row.system_chars.unwrap_or_default(),
+        segment_count: stored.len() as i64,
+        cache_points: row.system_cache_points.unwrap_or_default(),
+        segments: stored,
+    })
+}
+
+/// The declared tool set: its fingerprint, its weight, and the declarations.
+///
+/// The fingerprint covers descriptions and schemas, not just names. A tool whose
+/// description was rewritten is a different harness — that is drift worth seeing,
+/// and a name-only hash would call the two configurations identical.
+fn tool_shape(row: &mut GenerationRow, normalized: &NormalizedCall) -> Option<ToolSetRow> {
+    let declared = &normalized.declared_tools;
+    row.tools_declared_count = Some(declared.len() as i64);
+    if declared.is_empty() {
+        return None;
     }
+
+    // Sorted by name so the fingerprint is stable when the client reorders a set
+    // it did not otherwise change.
+    let mut tools: Vec<&crate::parse::model::ToolDecl> = declared.iter().collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut parts: Vec<String> = Vec::with_capacity(tools.len());
+    let mut rows = Vec::with_capacity(tools.len());
+    for (seq, tool) in tools.iter().enumerate() {
+        let schema = tool.input_schema.as_ref().map(Value::to_string);
+        let description = tool.description.clone();
+        // What this declaration costs the request: name, prose and schema.
+        let chars = (tool.name.chars().count()
+            + description
+                .as_deref()
+                .map_or(0, |text| text.chars().count())
+            + schema.as_deref().map_or(0, |text| text.chars().count())) as i64;
+        parts.push(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            tool.name,
+            description.as_deref().unwrap_or_default(),
+            schema.as_deref().unwrap_or_default()
+        ));
+        rows.push(ToolSchemaRow {
+            seq: seq as i64,
+            name: tool.name.clone(),
+            server: extract::mcp_server(&tool.name),
+            is_mcp: tool.name.starts_with("mcp__"),
+            description,
+            input_schema: schema,
+            chars,
+        });
+    }
+
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let hash = extract::fingerprint(&refs);
+    let total_chars = rows.iter().map(|tool| tool.chars).sum();
+    row.tools_hash = Some(hash.clone());
+    row.tools_chars = Some(total_chars);
+    Some(ToolSetRow {
+        tools_hash: hash,
+        tool_count: rows.len() as i64,
+        mcp_count: rows.iter().filter(|tool| tool.is_mcp).count() as i64,
+        total_chars,
+        tools: rows,
+    })
 }
 
 /// Conversation size and the prefix fingerprint used for chain detection.

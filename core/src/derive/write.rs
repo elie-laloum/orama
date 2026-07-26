@@ -44,7 +44,8 @@ pub fn write_derived(conn: &Connection, derived: &Derived) -> Result<()> {
             retry_count, should_retry, ratelimit_status, ratelimit_5h_utilization,
             ratelimit_7d_utilization, ratelimit_reset_at, overage_status,
             system_hash, system_chars, system_segments_count, system_cache_points,
-            tools_hash, tools_declared_count, messages_count, context_chars, history_prefix_hash,
+            tools_hash, tools_declared_count, tools_chars,
+            messages_count, context_chars, history_prefix_hash,
             tool_call_count, tools_called, user_prompt, block_counts,
             new_user_turn, first_turn_hash
         ) VALUES (
@@ -63,7 +64,8 @@ pub fn write_derived(conn: &Connection, derived: &Derived) -> Result<()> {
             :retry_count, :should_retry, :ratelimit_status, :ratelimit_5h_utilization,
             :ratelimit_7d_utilization, :ratelimit_reset_at, :overage_status,
             :system_hash, :system_chars, :system_segments_count, :system_cache_points,
-            :tools_hash, :tools_declared_count, :messages_count, :context_chars, :history_prefix_hash,
+            :tools_hash, :tools_declared_count, :tools_chars,
+            :messages_count, :context_chars, :history_prefix_hash,
             :tool_call_count, :tools_called, :user_prompt, :block_counts,
             :new_user_turn, :first_turn_hash
         )
@@ -143,6 +145,7 @@ pub fn write_derived(conn: &Connection, derived: &Derived) -> Result<()> {
             ":system_cache_points": row.system_cache_points,
             ":tools_hash": row.tools_hash,
             ":tools_declared_count": row.tools_declared_count,
+            ":tools_chars": row.tools_chars,
             ":messages_count": row.messages_count,
             ":context_chars": row.context_chars,
             ":history_prefix_hash": row.history_prefix_hash,
@@ -192,12 +195,89 @@ pub fn write_derived(conn: &Connection, derived: &Derived) -> Result<()> {
         )?;
     }
 
+    write_harness(conn, derived)?;
+
     // A previous failure for this call is resolved once derivation succeeds.
     conn.execute(
         "DELETE FROM derive_failures WHERE call_id = ?1",
         [row.call_id],
     )?;
     Ok(())
+}
+
+/// Store the system prompt and tool set this call declared.
+///
+/// `INSERT OR IGNORE` rather than upsert: the primary key is a fingerprint of
+/// the content, so a row that already exists is by construction byte-identical
+/// and re-writing it would be pure work. These rows are shared across calls and
+/// so are never deleted per call — unlike everything else in `write_derived`.
+fn write_harness(conn: &Connection, derived: &Derived) -> Result<()> {
+    if let Some(prompt) = &derived.system_prompt {
+        conn.execute(
+            r#"
+            INSERT OR IGNORE INTO system_prompts (
+                system_hash, segments, total_chars, segment_count, cache_points, parser_version
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            rusqlite::params![
+                prompt.system_hash,
+                serde_json::to_string(&prompt.segments).unwrap_or_else(|_| "[]".to_owned()),
+                prompt.total_chars,
+                prompt.segment_count,
+                prompt.cache_points,
+                PARSER_VERSION,
+            ],
+        )?;
+    }
+
+    let Some(set) = &derived.tool_set else {
+        return Ok(());
+    };
+    // The set row and its members go in together. Elsewhere a partial write is
+    // repaired by the next re-derive, which deletes by `call_id` first; here the
+    // presence of the set row is what suppresses re-writing the members, so a
+    // half-written set would stay half-written for good.
+    let tx = conn.unchecked_transaction()?;
+    let inserted = tx.execute(
+        r#"
+        INSERT OR IGNORE INTO tool_sets (
+            tools_hash, tool_count, total_chars, mcp_count, parser_version
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        rusqlite::params![
+            set.tools_hash,
+            set.tool_count,
+            set.total_chars,
+            set.mcp_count,
+            PARSER_VERSION,
+        ],
+    )?;
+    // The member rows are only written alongside a freshly inserted set. If the
+    // set was already present its members are already there, and re-inserting
+    // 121 declarations per call is exactly the cost this table exists to avoid.
+    if inserted == 0 {
+        return Ok(());
+    }
+    for tool in &set.tools {
+        tx.execute(
+            r#"
+            INSERT OR IGNORE INTO tool_schemas (
+                tools_hash, seq, name, server, is_mcp, description, input_schema, chars
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            rusqlite::params![
+                set.tools_hash,
+                tool.seq,
+                tool.name,
+                tool.server,
+                tool.is_mcp,
+                tool.description,
+                tool.input_schema,
+                tool.chars,
+            ],
+        )?;
+    }
+    tx.commit()
 }
 
 /// Record that a capture could not be derived. The raw row is already durable;
@@ -284,7 +364,9 @@ pub fn derive_live(conn: &Connection, call: &StoredCall) {
 /// Drop every derived row. `calls` is untouched.
 pub fn clear_derived(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "DELETE FROM alerts; DELETE FROM tool_calls; DELETE FROM generations; DELETE FROM sessions; DELETE FROM derive_failures;",
+        "DELETE FROM alerts; DELETE FROM tool_calls; DELETE FROM generations; DELETE FROM sessions; \
+         DELETE FROM tool_schemas; DELETE FROM tool_sets; DELETE FROM system_prompts; \
+         DELETE FROM derive_failures;",
     )
 }
 

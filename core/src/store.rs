@@ -81,6 +81,24 @@ pub fn spawn_writer(path: impl AsRef<Path>) -> anyhow::Result<StoreHandle> {
     let conn = rusqlite::Connection::open(path)?;
     apply_schema(&conn)?;
 
+    // Bring the derived layer up to the running parser before serving anything.
+    // Without this an upgraded binary reads a database derived by an older
+    // parser: the new columns and tables are simply empty, and the UI reports
+    // "nothing captured" for data that is in fact sitting in `calls`. Derivation
+    // is a pure function of the raw rows, so this is always safe to run.
+    match crate::derive::write::rebuild_if_stale(&conn) {
+        Ok(report) if report.derived > 0 || report.failed > 0 => {
+            eprintln!(
+                "orama: derived {} call(s), {} failed",
+                report.derived, report.failed
+            );
+        }
+        Ok(_) => {}
+        // A backfill failure must not stop the proxy: relaying traffic is the
+        // job that cannot be dropped, and analysis is best-effort.
+        Err(err) => eprintln!("orama: could not bring the derived layer up to date: {err}"),
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<CallRecord>();
 
     // The writer task owns the connection for its entire lifetime.
@@ -167,6 +185,15 @@ const MIGRATIONS: &[Migration] = &[
     },
     // v5 — persisted, queryable alerts.
     Migration::Sql(ALERTS_SCHEMA_V5),
+    // v6 — the harness itself: what the client declares, as opposed to what the
+    // conversation says. Content-addressed, so the 320 KB tool block a session
+    // re-sends on every call is stored once.
+    Migration::Sql(HARNESS_SCHEMA_V6),
+    Migration::AddColumn {
+        table: "generations",
+        column: "tools_chars",
+        ddl: "ALTER TABLE generations ADD COLUMN tools_chars INTEGER",
+    },
 ];
 
 /// Alert storage. Derived like everything else, so a policy change rebuilds it.
@@ -207,6 +234,53 @@ CREATE INDEX idx_alerts_category ON alerts(category, occurred_at DESC);
 CREATE INDEX idx_alerts_rule     ON alerts(rule_id, occurred_at DESC);
 CREATE INDEX idx_alerts_session  ON alerts(session_id, occurred_at DESC);
 CREATE INDEX idx_alerts_call     ON alerts(call_id);
+"#;
+
+/// The harness configuration a request declares: system prompt and tool set.
+///
+/// Keyed by content fingerprint rather than by call. A session re-sends an
+/// identical system prompt and tool block on every turn, so storing them per
+/// call would multiply the database by the number of turns to hold the same
+/// bytes — the exact reason the derived layer keeps only fingerprints elsewhere.
+/// Here the fingerprint *is* the key, which makes the content affordable to keep
+/// verbatim: one row per distinct harness configuration ever observed.
+///
+/// Rows are shared between calls, so they are never deleted per-call on
+/// re-derivation. A configuration no longer referenced by any generation is
+/// harmless; a full rebuild clears the tables outright.
+const HARNESS_SCHEMA_V6: &str = r#"
+CREATE TABLE system_prompts (
+    system_hash    TEXT PRIMARY KEY,
+    -- JSON array of {text, chars, cache_control}, in the order sent.
+    segments       TEXT NOT NULL,
+    total_chars    INTEGER NOT NULL,
+    segment_count  INTEGER NOT NULL,
+    cache_points   INTEGER NOT NULL,
+    parser_version TEXT NOT NULL
+);
+
+CREATE TABLE tool_sets (
+    tools_hash     TEXT PRIMARY KEY,
+    tool_count     INTEGER NOT NULL,
+    total_chars    INTEGER NOT NULL,
+    mcp_count      INTEGER NOT NULL,
+    parser_version TEXT NOT NULL
+);
+
+CREATE TABLE tool_schemas (
+    tools_hash   TEXT NOT NULL REFERENCES tool_sets(tools_hash) ON DELETE CASCADE,
+    seq          INTEGER NOT NULL,
+    name         TEXT NOT NULL,
+    server       TEXT,
+    is_mcp       INTEGER NOT NULL,
+    description  TEXT,
+    input_schema TEXT,
+    -- What this one declaration costs in the request, description plus schema.
+    chars        INTEGER NOT NULL,
+    PRIMARY KEY (tools_hash, name)
+);
+CREATE INDEX idx_tool_schemas_name  ON tool_schemas(name);
+CREATE INDEX idx_tool_schemas_chars ON tool_schemas(chars DESC);
 "#;
 
 /// Derived-layer DDL. Kept separate for readability; applied as migration v3.

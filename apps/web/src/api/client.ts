@@ -217,6 +217,145 @@ export interface CostBucket {
   priced_share: Nullable;
 }
 
+/* ── harness ──────────────────────────────────────────────────────────── */
+
+export interface SystemSegment {
+  text: string;
+  chars: number;
+  cache_control: boolean;
+}
+
+/** One distinct system prompt, with how widely it was used. */
+export interface SystemPromptSummary {
+  system_hash: string;
+  total_chars: number;
+  segment_count: number;
+  cache_points: number;
+  generations: number;
+  sessions: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  agent_roles: string | null;
+  latest_span: string | null;
+  /** First line of actual prompt text, past the billing header. */
+  opening: string | null;
+}
+
+export interface ToolSetSummary {
+  tools_hash: string;
+  tool_count: number;
+  total_chars: number;
+  mcp_count: number;
+  generations: number;
+  sessions: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  agent_roles: string | null;
+}
+
+/** A tool declaration, and whether anything ever called it. */
+export interface DeclaredTool {
+  name: string;
+  server: string | null;
+  is_mcp: number;
+  chars: number;
+  tool_sets: number;
+  calls: number;
+  last_used: string | null;
+}
+
+export interface ToolSchema {
+  seq: number;
+  name: string;
+  server: string | null;
+  is_mcp: number;
+  description: string | null;
+  input_schema: unknown;
+  chars: number;
+  calls: number;
+}
+
+export interface Harness {
+  budget: {
+    system_chars: Nullable;
+    tools_chars: Nullable;
+    history_chars: Nullable;
+    generations: number;
+    with_tools: Nullable;
+    max_tools_chars: Nullable;
+    max_history_chars: Nullable;
+  } | null;
+  system_prompts: SystemPromptSummary[];
+  tool_sets: ToolSetSummary[];
+  declared_tools: DeclaredTool[];
+}
+
+export type BlockKind =
+  | "text"
+  | "thinking"
+  | "tool_use"
+  | "tool_result"
+  | "image"
+  | "other";
+
+export interface ContextBlock {
+  kind: BlockKind;
+  /** Set when the harness injected this rather than the user writing it. */
+  content_tag: string | null;
+  chars: number;
+  tool_name: string | null;
+  is_error: boolean | null;
+  preview: string | null;
+  truncated: boolean;
+}
+
+export interface ContextTurn {
+  index: number;
+  role: "user" | "assistant" | "tool" | "system" | "other";
+  origin: "history" | "new";
+  chars: number;
+  blocks: ContextBlock[];
+}
+
+export interface CallContext {
+  shape: Record<string, unknown> & {
+    system_hash: string | null;
+    tools_hash: string | null;
+    system_segments_count: Nullable;
+    system_cache_points: Nullable;
+    tools_declared_count: Nullable;
+    messages_count: Nullable;
+    compaction_requested: number;
+    input_tokens: Nullable;
+    cache_read_tokens: Nullable;
+    cache_creation_tokens: Nullable;
+  };
+  /** The three sections are disjoint and sum to the whole request. */
+  composition: {
+    system_chars: number;
+    tools_chars: number;
+    history_chars: number;
+    total_chars: number;
+  };
+  system: {
+    segments: SystemSegment[];
+    total_chars: number;
+    segment_count: number;
+    cache_points: number;
+  } | null;
+  tools: {
+    name: string;
+    server: string | null;
+    is_mcp: number;
+    chars: number;
+    description_head: string | null;
+  }[];
+  thread: {
+    turns: ContextTurn[];
+    by_kind: { kind: BlockKind; count: number; chars: number }[];
+  };
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -267,6 +406,27 @@ export const api = {
     ),
   generationRaw: (span: string) =>
     get<Record<string, unknown>>(`/generations/${encodeURIComponent(span)}/raw`),
+  generationContext: (span: string) =>
+    get<CallContext>(`/generations/${encodeURIComponent(span)}/context`),
+
+  harness: () => get<Harness>("/harness"),
+  harnessSystem: (hash: string) =>
+    get<{
+      system: {
+        system_hash: string;
+        segments: SystemSegment[];
+        total_chars: number;
+        segment_count: number;
+        cache_points: number;
+      };
+      usage: Record<string, unknown> | null;
+    }>(`/harness/system/${encodeURIComponent(hash)}`),
+  harnessTools: (hash: string) =>
+    get<{
+      tool_set: ToolSetSummary;
+      tools: ToolSchema[];
+      usage: Record<string, unknown> | null;
+    }>(`/harness/tools/${encodeURIComponent(hash)}`),
 
   traces: (params: Params = {}) => get<{ traces: Trace[] }>(`/traces${qs(params)}`),
   trace: (id: string) =>

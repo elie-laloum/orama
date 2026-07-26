@@ -136,6 +136,10 @@ fn parse_turn(value: &Value, origin: Origin) -> Turn {
         Some("user") => Role::User,
         Some("assistant") => Role::Assistant,
         Some("tool") => Role::Tool,
+        // Claude Code injects inline system turns mid-thread — skill and command
+        // instructions, which run to tens of kilobytes. Collapsing them into
+        // `Other` hid the single largest non-tool item in a real capture.
+        Some("system") | Some("developer") => Role::System,
         _ => Role::Other,
     };
     let blocks = match value.get("content") {

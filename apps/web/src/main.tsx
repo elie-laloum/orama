@@ -10,6 +10,7 @@ import { Traces, TraceDetail } from "@/features/Traces";
 import { Sessions, SessionDetail } from "@/features/Sessions";
 import { Errors } from "@/features/Errors";
 import { Tools } from "@/features/Tools";
+import { Harness } from "@/features/Harness";
 import { Cost } from "@/features/Cost";
 import "@/styles/index.css";
 
@@ -28,6 +29,7 @@ const router = createHashRouter([
       { path: "sessions/:id", element: <SessionDetail /> },
       { path: "errors", element: <Errors /> },
       { path: "tools", element: <Tools /> },
+      { path: "harness", element: <Harness /> },
       { path: "cost", element: <Cost /> },
     ],
   },
