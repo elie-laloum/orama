@@ -26,15 +26,26 @@ use serde_json::{json, Map, Value};
 use crate::config::Config;
 use crate::util::now_rfc3339;
 
-/// The one key the Codex connector sets.
+/// The `model_providers` entry the Codex connector installs.
 ///
-/// Overriding the built-in provider's base URL rather than installing a custom
-/// `model_providers` entry is what keeps Codex's own authentication intact. A
-/// custom provider has to name where its credentials come from — an `env_key`
-/// that a ChatGPT-subscription install has no value for — so it breaks exactly
-/// the setup it was meant to trace. This key changes the destination and
-/// nothing else.
-const CODEX_BASE_KEY: &str = "openai_base_url";
+/// A provider entry rather than a bare `openai_base_url` override because it is
+/// the only place `supports_websockets` can be set. Codex otherwise opens every
+/// session by probing a WebSocket transport that Orama cannot proxy, retries it
+/// five times, and falls back to HTTP several seconds later.
+///
+/// What made an earlier version of this break subscription installs was not the
+/// entry itself but `env_key`: naming a variable a ChatGPT plan has no value for
+/// makes Codex refuse to start. `requires_openai_auth` is the field that hands
+/// the request to Codex's own credentials instead, and with it a subscription
+/// authenticates through Orama normally.
+const CODEX_PROVIDER: &str = "orama";
+
+/// Top-level key an earlier build of this connector used.
+///
+/// Still read and still cleaned up, so a config connected by that version
+/// reports honestly and disconnects completely rather than being left with two
+/// settings that disagree about where traffic goes.
+const CODEX_LEGACY_BASE_KEY: &str = "openai_base_url";
 
 /// A harness Orama knows how to configure without the user editing anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,7 +82,9 @@ impl Harness {
     pub fn effect(self) -> &'static str {
         match self {
             Harness::ClaudeCode => "Sets env.ANTHROPIC_BASE_URL in settings.json.",
-            Harness::Codex => "Sets openai_base_url in config.toml.",
+            Harness::Codex => {
+                "Adds a model_providers.orama entry and selects it as model_provider."
+            }
         }
     }
 
@@ -88,17 +101,13 @@ impl Harness {
             Harness::Codex => Some(match codex_auth() {
                 CodexAuth::ChatGpt => {
                     "No OPENAI_API_KEY found, so this assumes ChatGPT sign-in \
-                     and routes to the ChatGPT Codex backend. Codex must be \
-                     signed in already — run `codex login` first. It probes a \
-                     WebSocket transport before falling back to HTTP, which \
-                     Orama does not proxy, so the first call of a session \
-                     stalls a few seconds."
+                     and routes to the ChatGPT Codex backend, using Codex's own \
+                     credentials. Run `codex login` first if you are not \
+                     signed in."
                 }
                 CodexAuth::ApiKey => {
                     "OPENAI_API_KEY is set, so this routes to api.openai.com \
-                     for API-key billing. Codex probes a WebSocket transport \
-                     before falling back to HTTP, which Orama does not proxy, \
-                     so the first call of a session stalls a few seconds."
+                     for API-key billing."
                 }
             }),
         }
@@ -380,6 +389,40 @@ pub enum CodexAuth {
     ApiKey,
 }
 
+/// Is the config already in the shape this version writes?
+///
+/// Distinct from "points at us": a config connected by an older build points at
+/// us through a key this one no longer uses, and treating that as done would
+/// leave it permanently un-migrated — still working, but still probing a
+/// WebSocket on every session.
+fn is_current_shape(harness: Harness, path: &Path) -> bool {
+    match harness {
+        Harness::ClaudeCode => true,
+        Harness::Codex => fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+            .is_some_and(|document| {
+                document
+                    .get("model_provider")
+                    .and_then(|item| item.as_str())
+                    == Some(CODEX_PROVIDER)
+            }),
+    }
+}
+
+/// Does this URL point at a local Orama rather than a real provider?
+///
+/// Used only to decide whether a stale setting is ours to remove. Deliberately
+/// shape-based rather than an exact match against the running port: the config
+/// may have been written by an Orama started on a different one.
+fn is_our_base_url(url: &str) -> bool {
+    let host = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    (host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]"))
+        && (url.contains("/backend-api/codex") || url.ends_with("/v1"))
+}
+
 /// Detect how this machine's Codex authenticates.
 ///
 /// An API key present in the environment is the only positive evidence
@@ -437,9 +480,29 @@ fn read_base_url(harness: Harness, path: &Path) -> Result<Option<String>, Connec
         }
         Harness::Codex => {
             let document = parse_toml(path, &text)?;
-            Ok(document
-                .get(CODEX_BASE_KEY)
+            // The selected provider decides where traffic goes; a provider
+            // block that exists but is not selected is inert, and reporting it
+            // as connected would be a confident wrong answer.
+            let selected = document
+                .get("model_provider")
                 .and_then(|item| item.as_str())
+                .and_then(|name| {
+                    document
+                        .get("model_providers")
+                        .and_then(|item| item.as_table_like())
+                        .and_then(|providers| providers.get(name))
+                        .and_then(|provider| provider.as_table_like())
+                        .and_then(|provider| provider.get("base_url"))
+                        .and_then(|value| value.as_str())
+                });
+            Ok(selected
+                // Fall back to the key the previous version wrote, so a config
+                // connected by it is still recognised as ours.
+                .or_else(|| {
+                    document
+                        .get(CODEX_LEGACY_BASE_KEY)
+                        .and_then(|item| item.as_str())
+                })
                 .map(|url| url.trim_end_matches('/').to_owned()))
         }
     }
@@ -487,7 +550,7 @@ pub fn connect(harness: Harness, config: &Config) -> Result<ConnectOutcome, Conn
     // Refuse to write over a file we could not parse: replacing a config we do
     // not understand would destroy settings we never read.
     let previous = read_base_url(harness, &path)?;
-    if previous.as_deref() == Some(base.as_str()) {
+    if previous.as_deref() == Some(base.as_str()) && is_current_shape(harness, &path) {
         let state = ConnectionState::load();
         return Ok(ConnectOutcome {
             harness: harness.id(),
@@ -546,10 +609,58 @@ pub fn connect(harness: Harness, config: &Config) -> Result<ConnectOutcome, Conn
                 String::new()
             };
             let mut document = parse_toml(&path, &text)?;
-            record["previous"] = previous.clone().map(Value::from).unwrap_or(Value::Null);
-            // One key, at the top level. Nothing about which provider is
-            // selected or how it authenticates is touched.
-            document[CODEX_BASE_KEY] = toml_edit::value(base.clone());
+            record["previous_model_provider"] = document
+                .get("model_provider")
+                .and_then(|item| item.as_str())
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+            record["previous_openai_base_url"] = document
+                .get(CODEX_LEGACY_BASE_KEY)
+                .and_then(|item| item.as_str())
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+
+            // A base URL this connector set previously would now compete with
+            // the provider entry for the same job. Only ours is removed; one
+            // the user set themselves is left to be restored on disconnect.
+            if document
+                .get(CODEX_LEGACY_BASE_KEY)
+                .and_then(|item| item.as_str())
+                .is_some_and(is_our_base_url)
+            {
+                document.remove(CODEX_LEGACY_BASE_KEY);
+                record["previous_openai_base_url"] = Value::Null;
+            }
+
+            document["model_provider"] = toml_edit::value(CODEX_PROVIDER);
+            let providers = document
+                .entry("model_providers")
+                .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+            let providers =
+                providers
+                    .as_table_like_mut()
+                    .ok_or_else(|| ConnectError::Malformed {
+                        path: path.display().to_string(),
+                        format: "TOML",
+                        detail: "`model_providers` exists but is not a table".into(),
+                    })?;
+
+            let mut entry = toml_edit::Table::new();
+            entry["name"] = toml_edit::value("Orama");
+            entry["base_url"] = toml_edit::value(base.clone());
+            // Named explicitly so the entry cannot change meaning if Codex's
+            // own default ever moves.
+            entry["wire_api"] = toml_edit::value("responses");
+            // The reason this is a provider entry at all: without it every
+            // session opens with a WebSocket probe Orama cannot proxy.
+            entry["supports_websockets"] = toml_edit::value(false);
+            match codex_auth() {
+                // Hand the request to Codex's own credentials. Naming an
+                // `env_key` here is what broke subscription installs.
+                CodexAuth::ChatGpt => entry["requires_openai_auth"] = toml_edit::value(true),
+                CodexAuth::ApiKey => entry["env_key"] = toml_edit::value("OPENAI_API_KEY"),
+            }
+            providers.insert(CODEX_PROVIDER, toml_edit::Item::Table(entry));
 
             write_atomic(&path, &document.to_string())?;
         }
@@ -628,16 +739,41 @@ pub fn disconnect(harness: Harness, config: &Config) -> Result<ConnectOutcome, C
         }
         Harness::Codex => {
             let mut document = parse_toml(&path, &text)?;
-            let previous = record
-                .as_ref()
-                .and_then(|entry| entry.get("previous"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let recorded = |key: &str| {
+                record
+                    .as_ref()
+                    .and_then(|entry| entry.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
 
-            match previous {
-                Some(url) => document[CODEX_BASE_KEY] = toml_edit::value(url),
+            match recorded("previous_model_provider") {
+                Some(name) => document["model_provider"] = toml_edit::value(name),
                 None => {
-                    document.remove(CODEX_BASE_KEY);
+                    document.remove("model_provider");
+                }
+            }
+            match recorded("previous_openai_base_url") {
+                Some(url) => document[CODEX_LEGACY_BASE_KEY] = toml_edit::value(url),
+                None => {
+                    // Only ever remove a base URL that points at us; one the
+                    // user set themselves is not ours to delete.
+                    if document
+                        .get(CODEX_LEGACY_BASE_KEY)
+                        .and_then(|item| item.as_str())
+                        .is_some_and(is_our_base_url)
+                    {
+                        document.remove(CODEX_LEGACY_BASE_KEY);
+                    }
+                }
+            }
+            if let Some(providers) = document
+                .get_mut("model_providers")
+                .and_then(|item| item.as_table_like_mut())
+            {
+                providers.remove(CODEX_PROVIDER);
+                if providers.is_empty() {
+                    document.remove("model_providers");
                 }
             }
             write_atomic(&path, &document.to_string())?;
@@ -773,19 +909,22 @@ mod tests {
             after.contains("# my notes"),
             "comments must survive: {after}"
         );
-        assert!(after.contains("openai_base_url ="), "{after}");
-        // The whole point of overriding the base URL rather than installing a
-        // provider: which provider is selected, and how it authenticates, are
-        // left exactly as found. Naming an env_key is what broke subscription
-        // installs — Codex refuses to start when that variable is unset.
-        assert!(after.contains("model_provider = \"mine\""), "{after}");
-        assert!(after.contains("[model_providers.mine]"), "{after}");
+        assert!(after.contains("model_provider = \"orama\""), "{after}");
+        assert!(after.contains("[model_providers.orama]"), "{after}");
+        // Without an API key, credentials come from Codex itself. Naming an
+        // env_key is what made a subscription install refuse to start.
+        assert!(after.contains("requires_openai_auth = true"), "{after}");
         assert!(!after.contains("env_key"), "{after}");
+        // The reason this is a provider entry rather than a base-URL override.
+        assert!(after.contains("supports_websockets = false"), "{after}");
+        // The user's own provider is left intact alongside ours.
+        assert!(after.contains("[model_providers.mine]"), "{after}");
 
         disconnect(Harness::Codex, &config()).unwrap();
         let restored = fs::read_to_string(&path).unwrap();
-        assert!(!restored.contains("openai_base_url"), "{restored}");
-        assert!(restored.contains("model_provider = \"mine\""));
+        assert!(restored.contains("model_provider = \"mine\""), "{restored}");
+        assert!(restored.contains("[model_providers.mine]"), "{restored}");
+        assert!(!restored.contains("model_providers.orama"), "{restored}");
         assert!(restored.contains("# my notes"));
     }
 
@@ -801,8 +940,56 @@ mod tests {
         // path prefix; api.openai.com/v1 would 404 it however well it parsed.
         // That prefix is also what routes it back out again.
         assert!(
-            written.contains("openai_base_url = \"http://127.0.0.1:8787/backend-api/codex\""),
+            written.contains("base_url = \"http://127.0.0.1:8787/backend-api/codex\""),
             "{written}"
+        );
+        assert!(written.contains("requires_openai_auth = true"), "{written}");
+    }
+
+    #[test]
+    fn a_config_connected_by_the_old_base_url_scheme_disconnects_cleanly() {
+        let _sandbox = Sandbox::new("codex-legacy");
+        std::env::remove_var("OPENAI_API_KEY");
+        let path = config_path(Harness::Codex).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // What an earlier build of this connector wrote.
+        fs::write(
+            &path,
+            "model = \"gpt-5\"\nopenai_base_url = \"http://127.0.0.1:8787/backend-api/codex\"\n",
+        )
+        .unwrap();
+
+        // It still reads as connected, rather than looking like a stranger's.
+        let status = status(Harness::Codex, &config(), &ConnectionState::load());
+        assert!(status.connected, "{status:?}");
+
+        // Re-connecting replaces it instead of leaving two settings that
+        // disagree about where traffic goes.
+        connect(Harness::Codex, &config()).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("openai_base_url"), "{after}");
+        assert!(after.contains("[model_providers.orama]"), "{after}");
+
+        disconnect(Harness::Codex, &config()).unwrap();
+        let restored = fs::read_to_string(&path).unwrap();
+        assert!(!restored.contains("openai_base_url"), "{restored}");
+        assert!(!restored.contains("orama"), "{restored}");
+        assert!(restored.contains("model = \"gpt-5\""), "{restored}");
+    }
+
+    #[test]
+    fn a_base_url_the_user_set_themselves_is_left_alone() {
+        let _sandbox = Sandbox::new("codex-foreign-base");
+        let path = config_path(Harness::Codex).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "openai_base_url = \"https://gateway.internal/v1\"\n").unwrap();
+
+        connect(Harness::Codex, &config()).unwrap();
+        disconnect(Harness::Codex, &config()).unwrap();
+        let restored = fs::read_to_string(&path).unwrap();
+        assert!(
+            restored.contains("openai_base_url = \"https://gateway.internal/v1\""),
+            "a setting we did not make is not ours to remove: {restored}"
         );
     }
 
@@ -819,9 +1006,15 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
         let written = written.unwrap();
         assert!(
-            written.contains("openai_base_url = \"http://127.0.0.1:8787/v1\""),
+            written.contains("base_url = \"http://127.0.0.1:8787/v1\""),
             "{written}"
         );
+        // With a key present, that is what Codex should authenticate with.
+        assert!(
+            written.contains("env_key = \"OPENAI_API_KEY\""),
+            "{written}"
+        );
+        assert!(!written.contains("requires_openai_auth"), "{written}");
     }
 
     #[test]

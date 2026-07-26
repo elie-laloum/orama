@@ -193,15 +193,17 @@ async fn codex_connector_overrides_the_base_url_without_touching_auth() {
 
     let written = std::fs::read_to_string(sandbox.codex_config()).unwrap();
     // No API key on this machine, so subscription auth: a different backend
-    // under a different path prefix, reached without naming any credential.
+    // under a different path prefix, reached on Codex's own credentials.
     assert!(
-        written.contains("openai_base_url = \"http://127.0.0.1:8787/backend-api/codex\""),
+        written.contains("base_url = \"http://127.0.0.1:8787/backend-api/codex\""),
         "{written}"
     );
-    // Installing a provider would have to say where its key comes from, and an
-    // env_key a subscription install cannot satisfy is what broke Codex.
+    assert!(written.contains("requires_openai_auth = true"), "{written}");
+    // Naming a key a subscription install has no value for is what made Codex
+    // refuse to start.
     assert!(!written.contains("env_key"), "{written}");
-    assert!(!written.contains("model_provider"), "{written}");
+    // Suppresses the WebSocket probe Orama cannot proxy.
+    assert!(written.contains("supports_websockets = false"), "{written}");
 }
 
 #[tokio::test]
