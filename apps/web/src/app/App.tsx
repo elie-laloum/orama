@@ -33,8 +33,11 @@ function useRoute() {
 function go(path: string) {
 	window.location.hash = path;
 }
-function formatNumber(value?: number) {
-	return value === undefined ? "—" : value.toLocaleString();
+function formatNumber(value?: number | null) {
+	// The API sends an absent count as JSON null, not undefined — a strict
+	// `=== undefined` check let null through and crashed on .toLocaleString().
+	// Absent is rendered as unknown, never as zero.
+	return value == null ? "—" : value.toLocaleString();
 }
 function formatTime(value?: string) {
 	return value ? new Date(value).toLocaleString() : "—";

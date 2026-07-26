@@ -482,12 +482,15 @@ const RULES: &[Rule] = &[
         explanation: "A successful non-streaming call has no stored response body.",
         impact: "Tokens, cost and outcome are unknown for this call — not zero, unknown.",
         recommendation: "Captures taken before response-body recording landed cannot be recovered.",
+        // Scoped to model calls: a health probe with an empty body is honestly
+        // recorded as having no response, but it is not a gap worth reporting.
         sql: r#"
             SELECT 'warning', 'call', span_id, call_id, span_id, trace_id, session_id,
                    'No response body was stored, so usage and cost are unknown.',
                    json_object('http_status', http_status, 'model', model),
                    NULL, NULL, NULL, started_at
-              FROM generations WHERE error_kind = 'body_missing'
+              FROM generations
+             WHERE error_kind = 'body_missing' AND model IS NOT NULL
         "#,
     },
     Rule {

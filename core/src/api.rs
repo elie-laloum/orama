@@ -70,6 +70,11 @@ pub fn routes(store: ReadStore) -> Router {
         .route("/ui", get(ui_index))
         .route("/ui/", get(ui_index))
         .route("/ui/main.js", get(ui_bundle))
+        // Anything else under /ui belongs to the dashboard, not upstream. Without
+        // this the relay's catch-all forwarded the UI's own asset requests —
+        // sourcemaps, favicons — to the model provider, which then appeared in
+        // the capture as if they were model traffic.
+        .route("/ui/*rest", get(ui_asset))
         .route("/api/calls", get(list_handler))
         .route("/api/calls/:id", get(detail_handler))
         .route("/api/calls/:id/normalized", get(normalized_handler))
@@ -395,6 +400,12 @@ async fn ui_index() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         Html(UI_HTML),
     )
+}
+
+/// Any other /ui path. The SPA owns this namespace, so an unknown asset is a
+/// 404 from the dashboard rather than a request forwarded to the provider.
+async fn ui_asset() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "not found")
 }
 
 /// GET /ui/main.js — the compiled dashboard bundle.

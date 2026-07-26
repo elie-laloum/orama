@@ -86,7 +86,17 @@ pub fn derive_one(call: &StoredCall) -> Derived {
             .or(record.response_body.as_ref()),
     );
     cache_ttl_fallback(&mut generation, body);
-    outcome(&mut generation, &normalized, headers, response_headers);
+    // Whether any response was captured at all — distinct from whether that
+    // response happened to be a model message.
+    let captured_response =
+        record.response_reconstructed.is_some() || record.response_body.is_some();
+    outcome(
+        &mut generation,
+        &normalized,
+        headers,
+        response_headers,
+        captured_response,
+    );
     cost(&mut generation);
 
     let tool_calls = tool_calls(&normalized, &generation);
@@ -390,6 +400,7 @@ fn outcome(
     normalized: &NormalizedCall,
     headers: &Value,
     response_headers: Option<&Value>,
+    captured_response: bool,
 ) {
     row.error_message = normalized.error.clone();
     row.retry_count =
@@ -435,8 +446,11 @@ fn outcome(
         Some("http".to_owned())
     } else if row.is_stream && row.ended_at.is_none() {
         Some("stream_incomplete".to_owned())
-    } else if row.input_tokens.is_none() && row.http_status == Some(200) {
-        // A successful call with no usage means the response was never captured.
+    } else if !captured_response && row.http_status == Some(200) {
+        // The response itself was lost. This is a capture gap — distinct from a
+        // response we did record that simply is not a model message, such as a
+        // token count or a health probe, which have no usage to report and are
+        // not a defect.
         Some("body_missing".to_owned())
     } else {
         None
