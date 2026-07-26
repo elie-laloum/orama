@@ -1,6 +1,6 @@
 # Security Policy
 
-tracer sits on the path between an agent harness and an LLM API and writes what
+Orama sits on the path between an agent harness and an LLM API and writes what
 it sees to disk. Security issues here are about **data exposure** first and
 foremost. Please read the threat model below before reporting — some behaviours
 that look alarming are documented and intentional.
@@ -23,12 +23,12 @@ Report privately through either channel:
 
 - GitHub **Security Advisories** → *Report a vulnerability* on the repository
   (preferred — keeps the discussion attached to the code).
-- Email **pro@elielaloum.com** with `[tracer security]` in the subject.
+- Email **pro@elielaloum.com** with `[orama security]` in the subject.
 
 Please include:
 
 - What the issue is and the impact you believe it has.
-- Version or commit SHA, OS, and how tracer was launched (flags, `--host`).
+- Version or commit SHA, OS, and how Orama was launched (flags, `--host`).
 - Steps to reproduce, or a minimal proof of concept.
 - Any suggested fix, if you have one.
 
@@ -51,9 +51,9 @@ coordinated disclosure is appreciated.
 
 ## Threat model
 
-Understanding what tracer is helps separate bugs from designed behaviour.
+Understanding what Orama is helps separate bugs from designed behaviour.
 
-**Assumptions.** tracer is a local developer tool run by a single trusted user
+**Assumptions.** Orama is a local developer tool run by a single trusted user
 on their own machine. It listens on loopback by default. The captured data
 belongs to the user running it.
 

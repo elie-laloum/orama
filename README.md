@@ -1,4 +1,4 @@
-# tracer — LLM Harness Tracer
+# Orama — LLM Harness Tracer
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE.md)
 
@@ -6,7 +6,7 @@ A local, open-source tool that transparently intercepts Claude Code's API traffi
 and shows you exactly what the harness sends on every call — the full system
 prompt, message history, declared tools, and the reconstructed response.
 
-Unlike SDK-based tools, tracer requires **no code changes and no SDK**: it works
+Unlike SDK-based tools, Orama requires **no code changes and no SDK**: it works
 with an unmodified Claude Code binary by pointing `ANTHROPIC_BASE_URL` at a local
 proxy. No MITM, no certificates.
 
@@ -16,7 +16,7 @@ the only network egress is the relay to the upstream API.
 ## How it works
 
 ```text
-Claude Code ──HTTP──▶ tracer proxy ──HTTPS──▶ api.anthropic.com
+Claude Code ──HTTP──▶  Orama proxy  ──HTTPS──▶ api.anthropic.com
                           │
                           ├─ tees every request/response (streaming included)
                           ├─ redacts auth headers, stores the rest verbatim
@@ -129,7 +129,8 @@ Cargo workspace plus a frontend app:
 - `core/` — the library: config, relay, streaming tee, SSE reconstruction,
   SQLite store, provider parsing/normalization, signals and diagnostics,
   read-only API. A future Tauri shell can depend on this directly.
-- `cli/` — thin `tracer` binary.
+- `cli/` — thin CLI binary. The crates and the shipped binary are still named
+  `tracer-core` / `tracer`; only the project is called Orama.
 - `apps/web/` — React + TypeScript dashboard (Rspack), embedded into the binary
   at build time.
 
