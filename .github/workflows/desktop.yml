@@ -71,8 +71,55 @@ jobs:
         # them and escape into the real home directory.
         run: cargo test -p orama-desktop -- --test-threads=1
 
+  # A draft release cannot be fetched by tag — the API resolves published ones
+  # only — so tauri-action falls back to paginating every release to find it,
+  # and each of the four bundle jobs does that on its own. Two that finish in
+  # the same window both miss, both create, and the installers end up split
+  # across duplicate drafts. Creating it once here and handing the matrix an id
+  # removes the race.
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Named for the version the app reports, not for the tag: the installers
+        # carry the one in tauri.conf.json, and a tag that had drifted from it
+        # would put two different numbers on the same release. Reusing an
+        # existing release keeps a re-run from failing on the tag it already
+        # made.
+        run: |
+          version="$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)"
+          id="$(TAG="$GITHUB_REF_NAME" gh api "repos/$GITHUB_REPOSITORY/releases" \
+                  --paginate --jq '.[] | select(.tag_name == env.TAG) | .id' | head -n1)"
+          if [ -z "$id" ]; then
+            id="$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+                    -f tag_name="$GITHUB_REF_NAME" \
+                    -f name="Orama $version" \
+                    -F draft=true -F prerelease=false --jq .id)"
+            echo "Created draft release $id for $GITHUB_REF_NAME."
+          else
+            echo "Reusing release $id for $GITHUB_REF_NAME."
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
   bundle:
-    if: github.event_name != 'pull_request'
+    needs: create-release
+    # `needs` on a skipped job skips this one too, and create-release runs only
+    # on a tag. always() keeps the manual path alive; the result checks still
+    # stop the matrix when a release was wanted and could not be made.
+    if: >-
+      always() && github.event_name != 'pull_request' &&
+      needs.create-release.result != 'failure' &&
+      needs.create-release.result != 'cancelled'
     permissions:
       contents: write
     strategy:
@@ -136,13 +183,19 @@ jobs:
           projectPath: apps/desktop
           # Only publish from a tag. A manual run still produces installers,
           # but attaches them to the run instead of inventing a release.
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && 'Orama __VERSION__' || '' }}
-          releaseDraft: true
-          prerelease: false
+          #
+          # create-release owns the release now, so the action uploads to an id
+          # it was given rather than resolving a tag itself. Empty on a manual
+          # run, which leaves it nothing to publish to and only the workflow
+          # artifacts below.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           # Let the action collect its own output. A hand-written glob has to
           # guess where each bundler wrote to — and a cross-compiled macOS
           # build does not land in the same place as a native one.
           uploadWorkflowArtifacts: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          workflowArtifactNamePattern: orama-${{ matrix.label }}
+          # Per file, not per job: the action uploads each bundle separately, so
+          # a pattern with no placeholder names them all the same and the second
+          # upload is a 409. `[bundle]` is what distinguishes them — deb from
+          # AppImage, dmg from app, nsis from msi.
+          workflowArtifactNamePattern: orama-${{ matrix.label }}-[bundle]
           args: ${{ matrix.args }}
