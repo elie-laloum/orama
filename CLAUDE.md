@@ -19,7 +19,7 @@ Code and Codex can be traced at once.
 
 ```sh
 cargo build                       # workspace; build.rs embeds apps/web/dist if present
-cargo test                        # 154 tests: unit + spawn-on-port-0 integration
+cargo test                        # 157 tests: unit + spawn-on-port-0 integration
 
 # WSL discovery is Windows-only at runtime. To exercise the real probe from
 # inside a distro (starts it; prints the paths and gateway it resolves):
@@ -116,6 +116,15 @@ upstream to forward to is not altering the exchange — but the choice must come
 from `parse::detect`, the same function that later picks the parser, or a call
 could be relayed as one dialect and read back as another.
 
+**Stopping is the one refusal, and it is explicit and unpersisted.**
+`POST /api/v2/proxy/stop` flips a flag the catch-all reads, and every proxied
+request is then refused with a 503 naming Orama — never dropped, never quietly
+passed through. The listener is not released: the dashboard is served by it, and
+giving it up would take down the surface holding the button that puts it back.
+The flag lives in memory only. Persisting it would mean a proxy that comes up
+refusing traffic because of a click in a previous session, which from the
+harness's side is indistinguishable from a broken install.
+
 **`connect.rs` is the only writer outside `store.rs`, and it writes no data.**
 It edits files that belong to a harness, never anything Orama derives from. Its
 three rules are load-bearing: edits are surgical (one key, comments and ordering
@@ -134,7 +143,9 @@ is keyed by it, so changing it would orphan the record of what we overwrote and
 turn the next disconnect into a guess. And every question that used to have one
 answer per harness now has one per target: which config file, which base URL,
 which environment `OPENAI_API_KEY` is read from. Answering any of them for the
-wrong site writes a working-looking config that captures nothing.
+wrong site writes a working-looking config that captures nothing. The dashboard
+splits the list by site for the same reason — one flat list of near-identical
+rows is an invitation to connect the wrong install.
 
 **Context for the WSL bridge: a guest cannot reach a loopback-bound Windows
 listener.** Measured, not inferred — a Windows server on `127.0.0.1` refuses a

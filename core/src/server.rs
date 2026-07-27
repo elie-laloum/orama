@@ -34,6 +34,10 @@ pub fn router(config: Config, store: Option<StoreHandle>) -> Router {
         started_at: now_rfc3339(),
         store: read_store.clone(),
         writer,
+        // The same flag the relay reads, not a copy of its value: the settings
+        // endpoints flip it and the catch-all sees the change on its next
+        // request.
+        running: state.running.clone(),
     };
 
     // The relay/health routes carry RelayState; finalise that state before

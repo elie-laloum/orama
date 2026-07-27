@@ -1,10 +1,9 @@
 import * as React from "react";
 import { NavLink, Outlet } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   AlertTriangle,
-  Boxes,
   DollarSign,
   Layers,
   LayoutDashboard,
@@ -65,9 +64,12 @@ export function AppShell() {
   return (
     <div className="flex h-full">
       <nav className="flex w-[196px] shrink-0 flex-col border-r border-border bg-surface">
-        <div className="flex h-11 items-center gap-2 border-b border-border px-3">
-          <Boxes size={15} className="text-accent" aria-hidden />
-          <span className="text-sm font-semibold tracking-tight">orama</span>
+        {/* The wordmark and its logo used to sit here, repeating the window's
+            own title and icon. What the corner is worth is the one fact no
+            title bar carries: whether traffic is flowing through this proxy
+            right now — and the switch that decides it. */}
+        <div className="flex h-11 items-center border-b border-border px-3">
+          <ProxyToggle />
           <span className="ml-auto text-2xs text-faint">local</span>
         </div>
 
@@ -94,6 +96,9 @@ export function AppShell() {
 
         <div className="space-y-1.5 border-t border-border px-3 py-2.5 text-2xs text-faint">
           <Counts meta={meta} />
+          {/* The event stream, not the proxy. Worded as "stream" since the
+              badge above owns "live": two indicators both saying live, meaning
+              different things, is how you learn to trust neither. */}
           <div className="flex items-center gap-1.5 pt-1">
             <span
               className={cn(
@@ -102,7 +107,7 @@ export function AppShell() {
               )}
               aria-hidden
             />
-            {live ? "live" : "reconnecting"}
+            {live ? "stream" : "reconnecting"}
           </div>
         </div>
       </nav>
@@ -111,6 +116,80 @@ export function AppShell() {
         <Outlet />
       </main>
     </div>
+  );
+}
+
+/**
+ * Whether the relay is forwarding, and the switch that decides it.
+ *
+ * Stopping keeps the port and the dashboard — only forwarding stops, and every
+ * proxied request is refused with a 503 until it is started again. That is a
+ * deliberate break rather than a quiet one: a harness pointed here has no other
+ * way to learn that the thing in its path went away.
+ *
+ * The state is never persisted, so this reads as running on every launch. A
+ * proxy that came back refusing traffic because of a click from a previous
+ * session would be indistinguishable from a broken install.
+ */
+function ProxyToggle() {
+  const client = useQueryClient();
+  const { data } = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const toggle = useMutation({
+    mutationFn: api.setProxyRunning,
+    onSuccess: () => client.invalidateQueries({ queryKey: ["settings"] }),
+  });
+
+  // While the round trip is in flight the badge shows where it is going, not
+  // where it has been — the click is the only feedback there is otherwise.
+  const running = toggle.isPending ? toggle.variables : data?.proxy.running;
+
+  if (running == null) {
+    return (
+      <span className="flex items-center gap-2 text-sm text-faint">
+        <span className="size-2 rounded-full bg-unknown" aria-hidden />
+        checking
+      </span>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => toggle.mutate(!running)}
+      disabled={toggle.isPending}
+      aria-pressed={running}
+      title={
+        toggle.error
+          ? String(toggle.error)
+          : running
+            ? "Relaying and capturing. Click to stop — connected harnesses will start failing."
+            : "Not relaying: every request through this proxy is refused. Click to start."
+      }
+      className={cn(
+        "group -ml-1 flex items-center gap-2 rounded-sm px-1 py-1 text-sm font-medium",
+        "hover:bg-raised disabled:opacity-60",
+        running ? "text-ok" : "text-error",
+      )}
+    >
+      <span className="relative flex size-2 shrink-0" aria-hidden>
+        <span
+          className={cn(
+            "absolute inline-flex size-full animate-ping rounded-full opacity-60",
+            running ? "bg-ok" : "bg-error",
+          )}
+        />
+        <span
+          className={cn(
+            "relative inline-flex size-2 rounded-full",
+            running ? "bg-ok" : "bg-error",
+          )}
+        />
+      </span>
+      {running ? "live" : "stopped"}
+      <span className="text-2xs text-faint opacity-0 group-hover:opacity-100">
+        {running ? "stop" : "start"}
+      </span>
+    </button>
   );
 }
 

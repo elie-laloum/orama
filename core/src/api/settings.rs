@@ -44,11 +44,16 @@ pub struct SettingsState {
     /// refresh has to re-price, and re-pricing is a write — which goes through
     /// the one task that owns the connection, never a second one.
     pub writer: Option<crate::store::StoreHandle>,
+    /// The relay's own run flag, shared rather than mirrored. Stopping is a
+    /// session-scoped decision held in memory: see [`crate::relay::RelayState`].
+    pub running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn routes(state: SettingsState) -> Router {
     Router::new()
         .route("/api/v2/settings", get(settings))
+        .route("/api/v2/proxy/start", post(start_proxy))
+        .route("/api/v2/proxy/stop", post(stop_proxy))
         .route("/api/v2/connectors/:id/connect", post(connect_handler))
         .route(
             "/api/v2/connectors/:id/disconnect",
@@ -92,6 +97,29 @@ async fn refresh_catalog(State(state): State<SettingsState>) -> Response {
     }
 }
 
+/// POST /api/v2/proxy/start — resume forwarding.
+async fn start_proxy(State(state): State<SettingsState>) -> Response {
+    set_running(&state, true)
+}
+
+/// POST /api/v2/proxy/stop — stop forwarding, without giving up the port.
+///
+/// The listener stays bound because the dashboard is served by it: dropping it
+/// would take down the surface holding the button that puts it back. What stops
+/// is the relay — every proxied request is refused with a 503 until it is
+/// started again, which is the honest thing to show a harness that is still
+/// pointed here.
+async fn stop_proxy(State(state): State<SettingsState>) -> Response {
+    set_running(&state, false)
+}
+
+fn set_running(state: &SettingsState, running: bool) -> Response {
+    state
+        .running
+        .store(running, std::sync::atomic::Ordering::Relaxed);
+    Json(json!({ "running": running })).into_response()
+}
+
 /// GET /api/v2/settings — everything the settings screen renders.
 async fn settings(State(state): State<SettingsState>) -> Response {
     let config = state.config.as_ref();
@@ -122,9 +150,19 @@ fn proxy_state(state: &SettingsState) -> Value {
         "upstream_anthropic": config.upstream,
         "upstream_openai": config.upstream_openai,
         "upstream_chatgpt": config.upstream_chatgpt,
+        // The host this proxy runs on, as `std::env::consts::OS`. The dashboard
+        // needs it to name the local half of a connector list: on Windows the
+        // rows split into two environments, and calling one of them "local"
+        // when the other one is equally local on the same machine explains
+        // nothing.
+        "platform": std::env::consts::OS,
         "db_path": config.db_path.display().to_string(),
         "db_bytes": db_bytes,
         "capturing": state.capturing,
+        // Whether the relay is forwarding. Separate from `capturing`, which is
+        // about whether the database opened: a stopped proxy with a healthy
+        // database records nothing because there is nothing to record.
+        "running": state.running.load(std::sync::atomic::Ordering::Relaxed),
         "started_at": state.started_at,
         "last_capture_at": last_capture,
         "parser_version": PARSER_VERSION,

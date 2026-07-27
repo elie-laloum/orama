@@ -68,7 +68,7 @@ function SettingsBody({ data }: { data: SettingsData }) {
   return (
     <>
       <Proxy proxy={data.proxy} />
-      <Connectors connectors={data.connectors} />
+      <Connectors connectors={data.connectors} platform={data.proxy.platform} />
       <Catalog catalog={data.proxy.catalog} />
       <Guides guides={data.guides} />
     </>
@@ -82,7 +82,14 @@ function Proxy({ proxy }: { proxy: ProxyState }) {
     <Panel
       title="Proxy"
       action={
-        proxy.capturing ? (
+        // Stopped outranks the capture state: a healthy database records
+        // nothing when nothing is being relayed, so "capturing" here would be
+        // true of the machinery and false of the world.
+        !proxy.running ? (
+          <Pill tone="error" title="Forwarding is stopped from the sidebar badge">
+            stopped
+          </Pill>
+        ) : proxy.capturing ? (
           <Pill tone="ok">capturing</Pill>
         ) : (
           <Pill tone="error" title="The database could not be opened at startup">
@@ -91,7 +98,15 @@ function Proxy({ proxy }: { proxy: ProxyState }) {
         )
       }
     >
-      {!proxy.capturing && (
+      {!proxy.running && (
+        <p className="flex items-start gap-2 border-b border-border bg-error/5 px-3 py-2 text-2xs text-error">
+          <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden />
+          Forwarding is stopped. Every request through this proxy is refused,
+          so any harness still pointed here is failing. Start it again from the
+          badge in the sidebar — it also comes back on its own next launch.
+        </p>
+      )}
+      {proxy.running && !proxy.capturing && (
         <p className="flex items-start gap-2 border-b border-border bg-error/5 px-3 py-2 text-2xs text-error">
           <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden />
           Traffic is being forwarded but nothing is being recorded — the capture
@@ -266,16 +281,91 @@ function Field({
 
 /* ── connectors ───────────────────────────────────────────────────────── */
 
-function Connectors({ connectors }: { connectors: Connector[] }) {
+/** What to call the machine itself, as opposed to a distro running on it. */
+const PLATFORM_LABEL: Record<string, string> = {
+  windows: "Windows",
+  macos: "macOS",
+  linux: "Linux",
+};
+
+/**
+ * The harnesses this proxy can configure, split by where they live.
+ *
+ * On Windows the same harness appears twice — once on the host, once inside each
+ * distro — and the two are genuinely different installs with different config
+ * files, different addresses, and different credentials. A single flat list
+ * invites connecting the wrong one, which writes a working-looking config that
+ * captures nothing. The tabs make the choice deliberate.
+ *
+ * They only appear when there is something on the other side of the boundary.
+ * On a machine with no WSL there is one environment, and a lone tab labelling it
+ * would be furniture.
+ */
+function Connectors({
+  connectors,
+  platform,
+}: {
+  connectors: Connector[];
+  platform: string;
+}) {
+  const local = connectors.filter((connector) => connector.site === "local");
+  const wsl = connectors.filter((connector) => connector.site === "wsl");
+  const hostLabel = PLATFORM_LABEL[platform] ?? "This machine";
+
+  const [site, setSite] = React.useState<"local" | "wsl">("local");
+  // A distro that goes away — shut down, unregistered — must not leave the
+  // panel showing an empty tab it gives no way out of.
+  const active = site === "wsl" && wsl.length === 0 ? "local" : site;
+  const shown = active === "wsl" ? wsl : local;
+
   return (
-    <Panel title="Connectors">
+    <Panel
+      title="Connectors"
+      action={
+        wsl.length > 0 && (
+          <div
+            role="tablist"
+            aria-label="Where the harness lives"
+            className="flex items-center gap-px rounded-sm border border-border p-px"
+          >
+            {(
+              [
+                ["local", hostLabel, local.length],
+                ["wsl", "WSL", wsl.length],
+              ] as const
+            ).map(([id, label, count]) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={active === id}
+                onClick={() => setSite(id)}
+                className={cn(
+                  "flex h-5 items-center gap-1.5 rounded-xs px-2 text-2xs",
+                  active === id
+                    ? "bg-raised text-fg"
+                    : "text-muted hover:text-fg",
+                )}
+              >
+                {label}
+                <span className="text-faint tnum">{count}</span>
+              </button>
+            ))}
+          </div>
+        )
+      }
+    >
       <p className="border-b border-border px-3 py-2 text-2xs text-faint">
         Edits the harness's own config file in place. Your existing credentials
         are forwarded untouched, and auth headers are redacted before anything
         is written to disk.
+        {wsl.length > 0 &&
+          (active === "wsl"
+            ? " These live inside a distribution and are reached across that boundary."
+            : ` These are the ${hostLabel} installs. A harness inside WSL is a separate one, on the other tab.`)}
       </p>
       <ul>
-        {connectors.map((connector) => (
+        {shown.map((connector) => (
           <ConnectorRow key={connector.id} connector={connector} />
         ))}
       </ul>
@@ -318,15 +408,9 @@ function ConnectorRow({ connector }: { connector: Connector }) {
       <div className="flex items-start gap-3 px-3 py-2.5">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
+            {/* No `wsl` pill: a row is only ever seen under the tab for its
+                own site, and the label already names the distro. */}
             <span className="text-sm font-medium">{connector.label}</span>
-            {connector.site === "wsl" && (
-              <Pill
-                tone="unknown"
-                title="This harness lives inside a WSL distribution, and is reached across that boundary."
-              >
-                wsl
-              </Pill>
-            )}
             {connector.error ? (
               <Pill tone="error">unreadable</Pill>
             ) : connector.connected ? (

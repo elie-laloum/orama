@@ -167,6 +167,81 @@ async fn each_dialect_reaches_its_own_upstream_through_one_listener() {
 }
 
 #[tokio::test]
+async fn stopping_the_proxy_refuses_traffic_and_starting_resumes_it() {
+    let cap = Captured::default();
+    let upstream_addr = spawn(
+        Router::new()
+            .fallback(any(mock_upstream_handler))
+            .with_state(cap.clone()),
+    )
+    .await;
+
+    let cfg = Config::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        0,
+        format!("http://{upstream_addr}"),
+    );
+    let proxy_addr = spawn(router(cfg, None)).await;
+    let client = reqwest::Client::new();
+
+    let call = |path: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .post(format!("http://{proxy_addr}{path}"))
+                .body(r#"{"model":"claude"}"#)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // A fresh proxy relays: stopping is a decision, never a default.
+    assert_eq!(call("/v1/messages").await.status(), StatusCode::OK);
+
+    client
+        .post(format!("http://{proxy_addr}/api/v2/proxy/stop"))
+        .send()
+        .await
+        .unwrap();
+    *cap.inner.lock().unwrap() = None;
+
+    let refused = call("/v1/messages?after=stop").await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(refused.headers().get("x-orama-state").unwrap(), "stopped");
+    // Refused, not merely unreported: upstream never saw the request.
+    assert!(cap.inner.lock().unwrap().is_none());
+
+    // The dashboard is served by the same listener, so it has to survive the
+    // stop — otherwise there is no way back.
+    let body = client
+        .get(format!("http://{proxy_addr}/api/v2/settings"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let settings: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(settings["proxy"]["running"], serde_json::json!(false));
+
+    client
+        .post(format!("http://{proxy_addr}/api/v2/proxy/start"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        call("/v1/messages?after=start").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        cap.inner.lock().unwrap().clone().unwrap().path_and_query,
+        "/v1/messages?after=start"
+    );
+}
+
+#[tokio::test]
 async fn relay_failure_returns_gateway_error_not_panic() {
     // Proxy pointed at a dead upstream port.
     let cfg = Config::new(

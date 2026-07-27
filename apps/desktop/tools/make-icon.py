@@ -9,6 +9,11 @@ every size and format the three bundlers need:
     python3 tools/make-icon.py
     npm run icon
 
+It also writes the dashboard's favicon (`apps/web/public/favicon.png`) from the
+very same rendering. The app window and the browser tab are two views of one
+program, so they get one mark — downsampled here rather than re-drawn, because a
+second copy of the geometry is a second thing to keep in step.
+
 Colours are taken from the dashboard's own stylesheet
 (`apps/web/src/styles/index.css`) and converted from OKLCH here, so the app
 icon and the page it opens cannot drift apart by hand-picked hex.
@@ -18,7 +23,16 @@ the generated PNGs are committed.
 """
 
 import math
+from pathlib import Path
+
 from PIL import Image, ImageDraw
+
+# Anchored to this file, not the working directory: one run has to land two
+# files in two apps, and `tauri icon` reads the first from `apps/desktop`.
+DESKTOP = Path(__file__).resolve().parents[1]
+APP_ICON = DESKTOP / "app-icon.png"
+FAVICON = DESKTOP.parent / "web/public/favicon.png"
+FAVICON_SIZE = 128
 
 # --- palette, lifted from apps/web/src/styles/index.css ---------------------
 SURFACE = (0.19, 0.006, 265)  # --color-surface
@@ -125,8 +139,15 @@ def main() -> None:
         fill=accent,
     )
 
-    image.resize((SIZE, SIZE), Image.LANCZOS).save("app-icon.png")
-    print(f"wrote app-icon.png ({SIZE}x{SIZE})")
+    full = image.resize((SIZE, SIZE), Image.LANCZOS)
+    full.save(APP_ICON)
+    print(f"wrote {APP_ICON} ({SIZE}x{SIZE})")
+
+    # Downsampled from the supersampled original rather than from the saved
+    # icon: resampling an already-resampled image softens the ring twice.
+    FAVICON.parent.mkdir(parents=True, exist_ok=True)
+    image.resize((FAVICON_SIZE, FAVICON_SIZE), Image.LANCZOS).save(FAVICON)
+    print(f"wrote {FAVICON} ({FAVICON_SIZE}x{FAVICON_SIZE})")
 
 
 if __name__ == "__main__":

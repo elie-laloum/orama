@@ -267,6 +267,20 @@ database — they edit a harness's own config file, as described above:
 | `POST /api/v2/connectors/:id/connect` | Point `claude-code` or `codex` at this proxy (`claude-code@Ubuntu` for one inside WSL) |
 | `POST /api/v2/connectors/:id/disconnect` | Restore what was there before |
 
+Two more change what the proxy does without writing anything at all — the state
+lives in memory for the life of the process:
+
+| Endpoint | Effect |
+| --- | --- |
+| `POST /api/v2/proxy/stop` | Stop forwarding. Proxied requests are refused with a 503; the dashboard, served by the same listener, stays up |
+| `POST /api/v2/proxy/start` | Forward again |
+
+This is the badge in the top-left of the dashboard: green and `live` while
+traffic is flowing, red and `stopped` when it is not, and a click either way.
+Stopping is a decision about the running session only — a restart always comes
+back forwarding, because a proxy that refused traffic on launch because of a
+click from yesterday is indistinguishable from a broken one.
+
 Every other path and method is transparently relayed upstream.
 
 ### The harness view

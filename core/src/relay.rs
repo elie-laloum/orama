@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -41,6 +42,14 @@ pub struct RelayState {
     pub upstream_chatgpt: Arc<str>,
     /// Optional capture sink. When `None`, the relay is pure pass-through.
     pub store: Option<StoreHandle>,
+    /// Whether the relay is forwarding at all. Flipped by the settings API so a
+    /// user can take the proxy out of the path without quitting the app.
+    ///
+    /// Deliberately in memory only: a proxy that remembered it was stopped would
+    /// come back up refusing traffic for harnesses still pointed at it, and the
+    /// reason would be a click from a previous run. Every start is a running
+    /// start; stopping is a decision about *this* session.
+    pub running: Arc<AtomicBool>,
 }
 
 impl RelayState {
@@ -60,7 +69,13 @@ impl RelayState {
             upstream_openai: Arc::from(config.upstream_openai.as_str()),
             upstream_chatgpt: Arc::from(config.upstream_chatgpt.as_str()),
             store,
+            running: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Is the relay forwarding traffic?
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
     }
 
     /// The upstream for a captured request's headers and path.
@@ -126,6 +141,23 @@ pub async fn relay(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    // Stopped means stopped: nothing is forwarded and nothing is recorded. The
+    // refusal is explicit rather than a silent drop, and it names Orama — a
+    // harness that suddenly fails should not leave the user debugging their
+    // provider. It is deliberately not shaped like a provider error: a client
+    // that retries on 503 will succeed the moment the proxy is started again.
+    if !state.is_running() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("content-type", "application/json"),
+                ("x-orama-state", "stopped"),
+            ],
+            r#"{"error":"orama is stopped and is not relaying requests; start it from the dashboard, or point this client back at the provider"}"#,
+        )
+            .into_response();
+    }
+
     let timestamp_start = now_rfc3339();
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {

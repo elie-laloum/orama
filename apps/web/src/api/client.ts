@@ -435,10 +435,19 @@ export interface ProxyState {
   upstream_openai: string;
   /** Codex on a ChatGPT subscription: a different backend, not a different path. */
   upstream_chatgpt: string;
+  /** The host OS, as Rust names it: `windows`, `macos`, `linux`. */
+  platform: string;
   db_path: string;
   db_bytes: Nullable;
   /** False when the database could not be opened: relaying, but not recording. */
   capturing: boolean;
+  /**
+   * Whether the relay is forwarding at all. Distinct from `capturing`: a
+   * stopped proxy refuses every proxied request, so there is nothing to record
+   * however healthy the database is. Never persisted — a restart always comes
+   * back running.
+   */
+  running: boolean;
   started_at: string;
   /** Null means nothing has ever been captured, not "captured at time zero". */
   last_capture_at: string | null;
@@ -638,6 +647,9 @@ export const api = {
   models: () => get<{ catalog: CatalogMeta | null; models: ModelUsage[] }>("/models"),
 
   settings: () => get<Settings>("/settings"),
+  /** Resume or suspend relaying. The listener stays bound either way. */
+  setProxyRunning: (running: boolean) =>
+    post<{ running: boolean }>(`/proxy/${running ? "start" : "stop"}`),
   connect: (id: string) =>
     post<ConnectOutcome>(`/connectors/${encodeURIComponent(id)}/connect`),
   disconnect: (id: string) =>
