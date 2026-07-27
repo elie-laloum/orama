@@ -64,6 +64,10 @@ async fn healthz() -> &'static str {
 /// reports rather than dying silently behind a blank window.
 pub struct Bound {
     listener: TcpListener,
+    /// Additional listeners on [`Config::extra_hosts`], serving the identical
+    /// router. Their addresses are recorded on the config as bound, so one that
+    /// could not be bound is absent from both rather than reported as working.
+    extra: Vec<TcpListener>,
     /// The configuration re-derived against the address actually bound, so a
     /// requested port of 0 reads back as the port the OS chose.
     config: Config,
@@ -88,10 +92,31 @@ impl Bound {
         self.store.is_some()
     }
 
+    /// Every address being listened on, primary first.
+    pub fn addrs(&self) -> Vec<SocketAddr> {
+        let mut all = vec![self.addr()];
+        all.extend(self.extra.iter().filter_map(|l| l.local_addr().ok()));
+        all
+    }
+
     /// Serve until the process is terminated.
+    ///
+    /// One router, cloned per listener rather than rebuilt: a second router
+    /// would be a second store handle and a second set of state, and the two
+    /// could answer the same question differently.
     pub async fn run(self) -> anyhow::Result<()> {
         let app = router(self.config, self.store);
-        axum::serve(self.listener, app).await?;
+        let mut serving = tokio::task::JoinSet::new();
+        for listener in std::iter::once(self.listener).chain(self.extra) {
+            let app = app.clone();
+            serving.spawn(async move { axum::serve(listener, app).await });
+        }
+        // Any listener failing takes the process down with it. A half-serving
+        // proxy is the state where a harness is configured to reach an address
+        // that has stopped answering, which is worse than stopping loudly.
+        while let Some(joined) = serving.join_next().await {
+            joined??;
+        }
         Ok(())
     }
 }
@@ -105,9 +130,34 @@ pub async fn bind(config: Config) -> anyhow::Result<Bound> {
     let listener = TcpListener::bind(SocketAddr::new(config.host, config.port)).await?;
     let local = listener.local_addr()?;
 
+    // Bind the bridge addresses on the port we actually got, which matters when
+    // the caller asked for port 0. A bridge that cannot be bound is reported and
+    // dropped rather than fatal: it is an extra way in, and losing it must not
+    // stop the proxy the local harnesses are already using.
+    let mut extra = Vec::new();
+    let mut bound_extra = Vec::new();
+    for host in config
+        .extra_hosts
+        .iter()
+        .copied()
+        .filter(|host| *host != local.ip())
+    {
+        match TcpListener::bind(SocketAddr::new(host, local.port())).await {
+            Ok(listener) => {
+                extra.push(listener);
+                bound_extra.push(host);
+            }
+            Err(err) => eprintln!(
+                "orama: could not also listen on {host}:{}: {err}",
+                local.port()
+            ),
+        }
+    }
+
     let config = Config {
         host: local.ip(),
         port: local.port(),
+        extra_hosts: bound_extra,
         ..config
     };
 
@@ -134,6 +184,7 @@ pub async fn bind(config: Config) -> anyhow::Result<Bound> {
 
     Ok(Bound {
         listener,
+        extra,
         config,
         store,
     })
@@ -152,6 +203,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     println!("capture db: {}", effective.db_path.display());
     println!("\n# paste into the shell that runs the agent:");
     println!("{}", effective.export_snippet());
+
+    // A guest cannot use the snippet above: its 127.0.0.1 is its own. Printing
+    // the one that works there is the difference between "the proxy is running"
+    // and "the proxy is reachable from where the agent actually runs".
+    for host in &effective.extra_hosts {
+        let host = host.to_string();
+        println!(
+            "\n# from inside WSL, where 127.0.0.1 is the guest's own loopback:\n\
+             export ANTHROPIC_BASE_URL={}\n\
+             export OPENAI_BASE_URL={}",
+            effective.base_url_on(&host),
+            effective.openai_base_url_on(&host),
+        );
+    }
     println!(
         "\n# or configure Claude Code and Codex in one click: {}/ui/#/settings",
         effective.public_base_url()

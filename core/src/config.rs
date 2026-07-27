@@ -54,6 +54,15 @@ pub struct Config {
     pub upstream_chatgpt: String,
     /// Path to the SQLite database file capture is written to.
     pub db_path: PathBuf,
+    /// Extra addresses to listen on, beyond [`Config::host`].
+    ///
+    /// Exists for one reason: a harness inside WSL cannot reach a listener bound
+    /// only to the Windows loopback, so bridging to it means also listening on
+    /// the virtual adapter the guest routes through. Deliberately a list of
+    /// specific addresses rather than a "bind everything" flag — the dashboard
+    /// is served by this same listener, so `0.0.0.0` would publish every
+    /// captured prompt and response to the local network unauthenticated.
+    pub extra_hosts: Vec<IpAddr>,
 }
 
 impl Default for Config {
@@ -65,6 +74,7 @@ impl Default for Config {
             upstream_openai: DEFAULT_UPSTREAM_OPENAI.to_string(),
             upstream_chatgpt: DEFAULT_UPSTREAM_CHATGPT.to_string(),
             db_path: PathBuf::from(DEFAULT_DB),
+            extra_hosts: Vec::new(),
         }
     }
 }
@@ -113,9 +123,25 @@ impl Config {
         self
     }
 
+    /// Override the addresses to listen on beyond [`Config::host`].
+    pub fn with_extra_hosts(mut self, hosts: Vec<IpAddr>) -> Self {
+        self.extra_hosts = hosts;
+        self
+    }
+
     /// The base URL a client should be pointed at.
     pub fn public_base_url(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        self.base_url_on(&self.host.to_string())
+    }
+
+    /// The same, for a client that reaches this proxy on some other address.
+    ///
+    /// Parameterised because "where are you" has more than one answer once a
+    /// client can be on the far side of a WSL boundary: the address a harness
+    /// inside a distro must use is not the one the dashboard is opened on, and
+    /// writing the wrong one produces a config that fails every request.
+    pub fn base_url_on(&self, host: &str) -> String {
+        format!("http://{host}:{}", self.port)
     }
 
     /// The base URL an OpenAI-dialect client should be pointed at.
@@ -124,7 +150,11 @@ impl Config {
     /// `/v1` belongs here — the relay forwards the path verbatim and the
     /// upstream sees exactly the route the client asked for.
     pub fn openai_base_url(&self) -> String {
-        format!("{}/v1", self.public_base_url())
+        self.openai_base_url_on(&self.host.to_string())
+    }
+
+    pub fn openai_base_url_on(&self, host: &str) -> String {
+        format!("{}/v1", self.base_url_on(host))
     }
 
     /// The base URL Codex should be pointed at when it authenticates through a
@@ -133,7 +163,11 @@ impl Config {
     /// Carries the upstream's own path prefix so the request arrives here
     /// self-describing: the relay only has to swap the origin.
     pub fn chatgpt_base_url(&self) -> String {
-        format!("{}{}codex", self.public_base_url(), CHATGPT_PREFIX)
+        self.chatgpt_base_url_on(&self.host.to_string())
+    }
+
+    pub fn chatgpt_base_url_on(&self, host: &str) -> String {
+        format!("{}{CHATGPT_PREFIX}codex", self.base_url_on(host))
     }
 
     /// The shell export snippet the user pastes to route a harness through us.

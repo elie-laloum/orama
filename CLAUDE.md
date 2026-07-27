@@ -19,7 +19,11 @@ Code and Codex can be traced at once.
 
 ```sh
 cargo build                       # workspace; build.rs embeds apps/web/dist if present
-cargo test                        # 135 tests: unit + spawn-on-port-0 integration
+cargo test                        # 154 tests: unit + spawn-on-port-0 integration
+
+# WSL discovery is Windows-only at runtime. To exercise the real probe from
+# inside a distro (starts it; prints the paths and gateway it resolves):
+ORAMA_WSL=1 cargo test -p orama-core --lib probe_a_real_machine -- --ignored --nocapture
 cargo fmt --all && cargo clippy --all-targets
 
 cargo run -- start --db orama.sqlite          # relay + API + dashboard on :8787
@@ -118,7 +122,38 @@ three rules are load-bearing: edits are surgical (one key, comments and ordering
 preserved), reversible (the replaced value is recorded, and a key we did not set
 is never removed), and atomic (temp file plus rename). A config that cannot be
 parsed is refused rather than rewritten — clobbering settings we never read
-would be worse than not connecting.
+would be worse than not connecting. All three hold across the WSL share too:
+`rename` over `\\wsl.localhost\...` replaces atomically and the written file
+lands owned by the distro's own user.
+
+**A connector target is a harness *and* a place.** `Target = (Harness, Site)`,
+where `Site` is `Local` or `Wsl(distro)`, because one harness can exist in more
+than one environment at once on the same machine. Two things follow that are easy
+to get wrong. A local target's id stays the bare `claude-code` — the state file
+is keyed by it, so changing it would orphan the record of what we overwrote and
+turn the next disconnect into a guess. And every question that used to have one
+answer per harness now has one per target: which config file, which base URL,
+which environment `OPENAI_API_KEY` is read from. Answering any of them for the
+wrong site writes a working-looking config that captures nothing.
+
+**Context for the WSL bridge: a guest cannot reach a loopback-bound Windows
+listener.** Measured, not inferred — a Windows server on `127.0.0.1` refuses a
+WSL 2 guest's connection, and the same server reachable on the vEthernet address
+answers it. So bridging needs both halves: the address written into the guest is
+the gateway of its default route, and the proxy binds that address as well. The
+extra bind is always one specific address and **never `0.0.0.0`** — the dashboard
+shares the listener with the relay, so binding every interface would publish the
+whole capture to the local network unauthenticated. Under `networkingMode=mirrored`
+and on WSL 1 loopback already works and nothing is bound. `ORAMA_WSL=0` disables
+discovery, and the connector tests set it so a run cannot spawn `wsl.exe`.
+
+**A relocated config directory inside WSL can only be found with a tty.**
+`CLAUDE_CONFIG_DIR` is typically exported from an *interactive* shell rc. `sh -lc`
+misses it and so does `zsh -lc`; `zsh -lic` finds it, but only when stdin is a
+tty, which a windowed Windows process does not give its children. The probe
+therefore runs the login shell under `script -qec`. Without that it reports "not
+set" for a variable that is set, and the connector edits a file the harness never
+opens — which is indistinguishable from the bug this bridge was built to fix.
 
 **Derived tables store fingerprints, not content.** Request bodies are ~96% of
 the database because each call re-sends the whole conversation. Derived rows hold
@@ -208,12 +243,14 @@ written down here. What must hold on any copy:
   A row with counters and no cost means the catalogue lost a model.
 - **A detector firing on more than a few dozen rows** is almost certainly noise.
 
-The last full check: 695 generations, $88.13, 9 unpriced (all of them responses
-that were never captured), 0 `data_quality.pricing_unknown` alerts.
+The last full check: 1,308 generations, $178.29, 17 unpriced (all of them
+responses that were never captured — the query above still returns zero), 0
+`data_quality.pricing_unknown` alerts, 0 derive failures.
 
-An earlier note here said 69 generations on a `tracer.sqlite` that no longer
-exists in the tree, and $6.37 spend. Both are stale — the numbers moved because
-the capture kept growing, not because anything regressed.
+Earlier notes here said 69 generations on a `tracer.sqlite` that no longer exists
+in the tree, then 695 and $88.13. All are stale — the numbers move because the
+capture keeps growing, not because anything regressed. Compare a copy against
+itself, never against the figure written here.
 
 ## Known gaps
 
@@ -245,7 +282,22 @@ the capture kept growing, not because anything regressed.
   prefix is how you bill `gpt-4o` at `gpt-4` rates — twelve times over.
 - The connectors are tested against sandboxed config directories
   (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `ORAMA_HOME` are repointed at a temp
-  dir). Never run those tests without the sandbox — they write real files.
+  dir, and `ORAMA_WSL=0` keeps discovery from spawning `wsl.exe`). Never run
+  those tests without the sandbox — they write real files.
+- **The WSL bridge has never been run from a Windows build.** Its decisions are
+  pure functions tested on recorded bytes, the probe was verified against a real
+  distro via `ORAMA_WSL=1`, the reachability model was measured with real
+  sockets, and a temp-plus-rename write over `\\wsl.localhost` was confirmed to
+  land with the right ownership. What is unverified is the assembled whole
+  running as a Windows process: no `orama-desktop.exe` was compiled or launched.
+  The parts most likely to be wrong there are the ones no Linux test can reach —
+  whether binding the vEthernet address is permitted without elevation, and
+  whether a windowed process's `wsl.exe` child behaves like the one a shell
+  spawns.
+- Mirrored networking is handled but unexercised: this machine runs NAT, and
+  confirming the mirrored path means `wsl --shutdown`, which cannot be done
+  mid-session. `127.0.0.1` reaching Windows in that mode is documented by
+  Microsoft rather than measured here.
 - Subagent nesting is implemented but unexercised: no capture contains an `Agent`
   tool invocation. It degrades to a flat trace rather than guessing.
 - No frontend tests.

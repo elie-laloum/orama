@@ -23,7 +23,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::connect::{self, Harness};
+use crate::connect::{self, Target};
 use crate::derive::PARSER_VERSION;
 use crate::detect::POLICY_VERSION;
 use crate::pricing::pricing_version;
@@ -108,6 +108,15 @@ fn proxy_state(state: &SettingsState) -> Value {
     let (db_bytes, last_capture) = capture_stats(&state.store);
     json!({
         "listening_on": format!("{}:{}", config.host, config.port),
+        // The bridge addresses, which is where a WSL harness reaches us. Listed
+        // separately from `listening_on` because they are not interchangeable:
+        // one is where the dashboard is, the other is only reachable from a
+        // guest.
+        "bridged_on": config
+            .extra_hosts
+            .iter()
+            .map(|host| format!("{host}:{}", config.port))
+            .collect::<Vec<_>>(),
         "base_url": config.public_base_url(),
         "openai_base_url": config.openai_base_url(),
         "upstream_anthropic": config.upstream,
@@ -213,12 +222,12 @@ async fn disconnect_handler(
 fn apply(
     state: &SettingsState,
     id: &str,
-    action: fn(Harness, &Config) -> Result<connect::ConnectOutcome, connect::ConnectError>,
+    action: fn(&Target, &Config) -> Result<connect::ConnectOutcome, connect::ConnectError>,
 ) -> Response {
-    let Some(harness) = Harness::parse(id) else {
+    let Some(target) = Target::parse(id) else {
         // An unknown connector names the accepted set, the same as an unknown
         // API filter does — a 404 with no detail is a debugging dead end.
-        let known: Vec<&str> = Harness::ALL.iter().map(|h| h.id()).collect();
+        let known: Vec<String> = Target::all().iter().map(Target::id).collect();
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown connector `{id}`; known: {}", known.join(", ")) })),
@@ -226,10 +235,10 @@ fn apply(
             .into_response();
     };
 
-    match action(harness, state.config.as_ref()) {
+    match action(&target, state.config.as_ref()) {
         Ok(outcome) => Json(outcome).into_response(),
         Err(err) => {
-            eprintln!("orama: {} connector failed: {err}", harness.id());
+            eprintln!("orama: {} connector failed: {err}", target.id());
             // The message says which file and why, which is the whole of what
             // the user needs to fix it by hand.
             (

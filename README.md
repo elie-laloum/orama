@@ -174,6 +174,38 @@ is copied to `<name>.orama.bak` before the first edit, writes are atomic, and
 base URL Orama did not set is never removed. Both harnesses read their config at
 startup, so restart the agent for the change to take effect.
 
+### Windows with WSL
+
+Running the app on Windows while the agent runs inside WSL is two environments,
+not one, and both halves of that have to be handled or neither works.
+
+The config file is on the far side of a share, so Settings lists the harnesses
+inside each distribution as their own rows — `Claude Code in Ubuntu` — alongside
+the Windows ones, and edits them at `\\wsl.localhost\<distro>\...`. Which file
+that is gets asked of the distribution rather than assumed: `CLAUDE_CONFIG_DIR`
+is usually exported from an interactive shell rc, so the probe runs the login
+shell under a pty to see what the harness itself would see.
+
+The address is the other half. A WSL 2 guest has its own loopback, so
+`127.0.0.1:8787` there is *the guest*, and a proxy bound only to the Windows
+loopback is unreachable from it. Under the default NAT networking the proxy
+therefore also listens on the virtual adapter the guest routes through, and that
+is the address written into the guest's config. Two consequences worth knowing:
+
+- **That address is reassigned when WSL restarts.** Settings says so on the row.
+  Reconnect if capture stops. Setting `networkingMode=mirrored` under `[wsl2]` in
+  `.wslconfig` makes `127.0.0.1` reach Windows for good, and the connector uses
+  it instead when it is on.
+- **The extra listener is one specific address, never `0.0.0.0`.** The dashboard
+  is served by the same listener as the relay, so binding every interface would
+  publish every captured prompt and response to the local network with nothing
+  in front of it. The virtual adapter reaches the WSL VM and nothing else.
+
+`ORAMA_WSL=0` turns discovery off entirely, and `orama start --no-wsl-bridge`
+skips the extra listener. Nothing here applies on any other platform, or to a
+proxy that is itself running inside WSL — that one is already in the same
+network namespace as the harness, and needs none of it.
+
 Anything else — the Anthropic and OpenAI SDKs, or an OpenAI-compatible host — is
 listed on the same page with the exact line to paste.
 
@@ -232,7 +264,7 @@ database — they edit a harness's own config file, as described above:
 
 | Endpoint | Effect |
 | --- | --- |
-| `POST /api/v2/connectors/:id/connect` | Point `claude-code` or `codex` at this proxy |
+| `POST /api/v2/connectors/:id/connect` | Point `claude-code` or `codex` at this proxy (`claude-code@Ubuntu` for one inside WSL) |
 | `POST /api/v2/connectors/:id/disconnect` | Restore what was there before |
 
 Every other path and method is transparently relayed upstream.

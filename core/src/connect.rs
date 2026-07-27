@@ -26,6 +26,8 @@ use serde_json::{json, Map, Value};
 use crate::config::Config;
 use crate::util::now_rfc3339;
 
+pub mod wsl;
+
 /// The `model_providers` entry the Codex connector installs.
 ///
 /// A provider entry rather than a bare `openai_base_url` override because it is
@@ -77,6 +79,34 @@ impl Harness {
         Harness::ALL.iter().copied().find(|h| h.id() == id)
     }
 
+    /// The directory this harness keeps its config in, relative to a home.
+    pub fn config_leaf(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => ".claude",
+            Harness::Codex => ".codex",
+        }
+    }
+
+    /// The file inside that directory which we edit.
+    pub fn config_file(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "settings.json",
+            Harness::Codex => "config.toml",
+        }
+    }
+
+    /// The environment variable that relocates the config directory.
+    ///
+    /// Named here rather than at each use because it is read on both sides of
+    /// the WSL boundary: from this process's own environment for a local
+    /// harness, and out of the guest's environment for one inside a distro.
+    pub fn config_dir_var(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "CLAUDE_CONFIG_DIR",
+            Harness::Codex => "CODEX_HOME",
+        }
+    }
+
     /// What connecting actually changes, in one line, for the UI to show
     /// *before* the button is pressed.
     pub fn effect(self) -> &'static str {
@@ -95,10 +125,14 @@ impl Harness {
     /// backends and different path prefixes, so the mode is inferred rather
     /// than assumed, and stating which one was picked is what makes a wrong
     /// guess correctable instead of mysterious.
-    pub fn caveat(self) -> Option<&'static str> {
+    ///
+    /// Takes the mode rather than detecting it, because which environment to
+    /// detect it in depends on where the harness lives — a Codex inside WSL
+    /// authenticates from the guest's environment, not this process's.
+    pub fn caveat(self, auth: CodexAuth) -> Option<&'static str> {
         match self {
             Harness::ClaudeCode => None,
-            Harness::Codex => Some(match codex_auth() {
+            Harness::Codex => Some(match auth {
                 CodexAuth::ChatGpt => {
                     "No OPENAI_API_KEY found, so this assumes ChatGPT sign-in \
                      and routes to the ChatGPT Codex backend, using Codex's own \
@@ -125,11 +159,14 @@ impl Harness {
 
 /// The home directory, across the platforms a local dev tool actually runs on.
 ///
-/// WSL is Linux and needs nothing special: `HOME` is the WSL home, which is
-/// where the harness installed under WSL keeps its config. A Windows-side
-/// install is a separate environment with its own `USERPROFILE`, and the two
-/// are deliberately not bridged — writing across the boundary would configure
-/// a harness the proxy's own `127.0.0.1` may not even resolve to.
+/// This is the *local* home only. A proxy running under WSL needs nothing more:
+/// `HOME` is the guest home, which is where a harness installed alongside it
+/// keeps its config, and both are already in the same network namespace. A proxy
+/// running on Windows is the asymmetric case — the harness may be inside a
+/// distro, with its config on the far side of a share and a different address
+/// needed to reach us. That direction is [`wsl`]'s job, and an earlier version
+/// of this comment described it as unbridgeable; it is bridgeable, but only once
+/// the address the guest can actually reach is part of the answer.
 fn home_dir() -> Option<PathBuf> {
     let from = |key: &str| {
         std::env::var_os(key)
@@ -146,34 +183,124 @@ fn home_dir() -> Option<PathBuf> {
     })
 }
 
+/// Where a harness lives, relative to the process configuring it.
+///
+/// The distinction exists because a Windows-side proxy and a harness inside a
+/// WSL distro are two environments, not one: the config file is on the far side
+/// of a share, and `127.0.0.1` means something different at each end. Modelling
+/// the place explicitly is what keeps those two facts from having to be
+/// rediscovered at every call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Site {
+    /// The same environment this proxy runs in.
+    Local,
+    /// A WSL distribution, seen from a proxy running on Windows.
+    Wsl(String),
+}
+
+/// A harness at a place — which is what a connector row actually is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub harness: Harness,
+    pub site: Site,
+}
+
+impl Target {
+    pub fn local(harness: Harness) -> Self {
+        Self {
+            harness,
+            site: Site::Local,
+        }
+    }
+
+    /// Stable identifier used in URLs and in the state file.
+    ///
+    /// A local target keeps the bare harness id it has always had. That is not
+    /// cosmetic: the state file is keyed by this string, so changing it would
+    /// orphan every record of what we overwrote and turn the next disconnect
+    /// into a guess.
+    pub fn id(&self) -> String {
+        match &self.site {
+            Site::Local => self.harness.id().to_owned(),
+            Site::Wsl(distro) => format!("{}@{distro}", self.harness.id()),
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<Target> {
+        match id.split_once('@') {
+            None => Harness::parse(id).map(Target::local),
+            Some((harness, distro)) if !distro.is_empty() => {
+                Harness::parse(harness).map(|harness| Target {
+                    harness,
+                    site: Site::Wsl(distro.to_owned()),
+                })
+            }
+            Some(_) => None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match &self.site {
+            Site::Local => self.harness.label().to_owned(),
+            Site::Wsl(distro) => format!("{} in {distro}", self.harness.label()),
+        }
+    }
+
+    /// Every target worth offering on this machine.
+    ///
+    /// The local pair always, plus one per harness per discovered distro. A
+    /// distro contributes rows whether or not the harness is installed in it:
+    /// "not connected, and this is the file that would be created" is a useful
+    /// answer, and deciding a harness is absent from the outside is exactly the
+    /// guess that got this wrong before.
+    pub fn all() -> Vec<Target> {
+        let mut targets: Vec<Target> = Harness::ALL.iter().copied().map(Target::local).collect();
+        for distro in wsl::distros() {
+            for &harness in Harness::ALL {
+                targets.push(Target {
+                    harness,
+                    site: Site::Wsl(distro.name.clone()),
+                });
+            }
+        }
+        targets
+    }
+}
+
+/// Look up a discovered distro by name.
+fn distro(name: &str) -> Result<wsl::Distro, ConnectError> {
+    wsl::distros()
+        .into_iter()
+        .find(|distro| distro.name == name)
+        .ok_or_else(|| ConnectError::NoDistro(name.to_owned()))
+}
+
 /// Where a harness keeps the config file we edit.
 ///
 /// Both harnesses let the user relocate their config directory; honouring
 /// those overrides means we edit the file the harness will actually read
-/// rather than a default path it ignores.
-pub fn config_path(harness: Harness) -> Result<PathBuf, ConnectError> {
-    let explicit = match harness {
-        Harness::ClaudeCode => std::env::var_os("CLAUDE_CONFIG_DIR"),
-        Harness::Codex => std::env::var_os("CODEX_HOME"),
-    }
-    .filter(|value| !value.is_empty())
-    .map(PathBuf::from);
-
-    let dir = match explicit {
-        Some(dir) => dir,
-        None => {
-            let home = home_dir().ok_or(ConnectError::NoHome)?;
-            match harness {
-                Harness::ClaudeCode => home.join(".claude"),
-                Harness::Codex => home.join(".codex"),
-            }
+/// rather than a default path it ignores. For a harness inside WSL the override
+/// lives in the guest's environment and the path has to be translated onto the
+/// share — see [`wsl`] for why neither can be skipped.
+pub fn config_path(target: &Target) -> Result<PathBuf, ConnectError> {
+    match &target.site {
+        Site::Local => {
+            let dir = match std::env::var_os(target.harness.config_dir_var())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+            {
+                Some(dir) => dir,
+                None => home_dir()
+                    .ok_or(ConnectError::NoHome)?
+                    .join(target.harness.config_leaf()),
+            };
+            Ok(dir.join(target.harness.config_file()))
         }
-    };
-
-    Ok(match harness {
-        Harness::ClaudeCode => dir.join("settings.json"),
-        Harness::Codex => dir.join("config.toml"),
-    })
+        // Assembled by the distro rather than joined onto here: a Windows path
+        // has to carry Windows separators whatever platform is doing the
+        // joining.
+        Site::Wsl(name) => Ok(distro(name)?.windows_config_file(target.harness)),
+    }
 }
 
 /// The directory Orama keeps its own files in — `$ORAMA_HOME`, or `~/.orama`.
@@ -200,6 +327,29 @@ fn state_path() -> Result<PathBuf, ConnectError> {
 pub enum ConnectError {
     #[error("could not locate a home directory (set HOME, or ORAMA_HOME)")]
     NoHome,
+    #[error("no WSL distribution named `{0}` was found")]
+    NoDistro(String),
+    /// The distro is there but there is no address it could reach us on. Its own
+    /// error rather than a silent fallback to `127.0.0.1`: that value parses,
+    /// writes, and reads back as connected while failing every request.
+    #[error(
+        "{distro} is behind a NAT and no gateway to Windows could be found, so there is no \
+         address it could reach this proxy on. Start the distribution and re-read, or set \
+         networkingMode=mirrored in .wslconfig to reach it on 127.0.0.1."
+    )]
+    NoRoute { distro: String },
+    /// The address exists but this proxy is not on it. Refused rather than
+    /// written, because the config would read back as connected while every
+    /// request from the guest went nowhere.
+    #[error(
+        "this proxy is not listening on {gateway}, the only address {distro} could reach it on. \
+         Restart Orama with the distribution running, or set networkingMode=mirrored in \
+         .wslconfig to reach it on 127.0.0.1."
+    )]
+    NotBridged {
+        distro: String,
+        gateway: std::net::IpAddr,
+    },
     #[error("{path}: {source}")]
     Io {
         path: String,
@@ -252,8 +402,8 @@ impl ConnectionState {
         write_atomic(&path, &text)
     }
 
-    fn get(&self, harness: Harness) -> Option<&Value> {
-        self.entries.get(harness.id())
+    fn get(&self, target: &Target) -> Option<&Value> {
+        self.entries.get(&target.id())
     }
 }
 
@@ -309,8 +459,12 @@ fn back_up(path: &Path) -> Option<PathBuf> {
 /// What a harness is currently pointed at, and whether that is us.
 #[derive(Debug, Clone, Serialize)]
 pub struct HarnessStatus {
-    pub id: &'static str,
-    pub label: &'static str,
+    pub id: String,
+    pub label: String,
+    /// `local`, or `wsl` for a harness inside a distribution.
+    pub site: &'static str,
+    /// The distribution this row is about, when it is about one.
+    pub distro: Option<String>,
     /// The file we would read and write. Shown so the user can check it, and
     /// so a wrong-home diagnosis takes one glance rather than a support thread.
     pub config_path: String,
@@ -320,13 +474,18 @@ pub struct HarnessStatus {
     /// Whatever it currently points at, ours or not. `None` means the harness
     /// is using its own default and talking to the provider directly.
     pub base_url: Option<String>,
+    /// What connecting would write. Reported rather than left for the client to
+    /// reassemble: it depends on how Codex authenticates *and* on which side of
+    /// a WSL boundary the harness sits, and a second implementation of that in
+    /// the dashboard is a second thing to drift.
+    pub expected_base_url: Option<String>,
     /// True when we wrote the current value, which is what makes disconnect
     /// safe to offer. A base URL someone else set is left alone.
     pub managed: bool,
     pub effect: &'static str,
     /// A prerequisite the connector cannot meet for you. Shown before the
     /// button, not after the harness stops working.
-    pub caveat: Option<&'static str>,
+    pub caveat: Option<String>,
     pub restart_required: bool,
     /// Set when the config could not be read or parsed. Connecting is refused
     /// rather than risking a clobber of a file we do not understand.
@@ -337,50 +496,167 @@ pub struct HarnessStatus {
 /// whose config is unreadable reports its own error and the rest still work.
 pub fn status_all(config: &Config) -> Vec<HarnessStatus> {
     let state = ConnectionState::load();
-    Harness::ALL
+    Target::all()
         .iter()
-        .map(|&harness| status(harness, config, &state))
+        .map(|target| status(target, config, &state))
         .collect()
 }
 
-fn status(harness: Harness, config: &Config, state: &ConnectionState) -> HarnessStatus {
-    let path = match config_path(harness) {
-        Ok(path) => path,
-        Err(err) => {
-            return HarnessStatus {
-                id: harness.id(),
-                label: harness.label(),
-                config_path: String::new(),
-                config_exists: false,
-                connected: false,
-                base_url: None,
-                managed: false,
-                effect: harness.effect(),
-                caveat: harness.caveat(),
-                restart_required: harness.restart_required(),
-                error: Some(err.to_string()),
+/// What connecting this target would write, and why that might be impossible.
+///
+/// Fallible where the single-site version was not, because a WSL target can be
+/// perfectly locatable on disk and still have no address the guest could reach
+/// us on. Reporting that is the whole point: the alternative is a config that
+/// looks connected and fails every request.
+pub fn expected_base_url(target: &Target, config: &Config) -> Result<String, ConnectError> {
+    let host = match &target.site {
+        Site::Local => config.host.to_string(),
+        Site::Wsl(name) => {
+            let address = distro(name)?
+                .host_address(wsl::networking())
+                .ok_or_else(|| ConnectError::NoRoute {
+                    distro: name.clone(),
+                })?;
+            // Reachable in principle is not reachable in fact. Anything but the
+            // address we are already serving has to be one we successfully
+            // bound, or the config we write points at nothing.
+            if address != config.host && !config.extra_hosts.contains(&address) {
+                return Err(ConnectError::NotBridged {
+                    distro: name.clone(),
+                    gateway: address,
+                });
             }
+            address.to_string()
         }
     };
 
-    let expected = expected_base_url(harness, config);
-    let (base_url, error) = match read_base_url(harness, &path) {
+    Ok(match target.harness {
+        Harness::ClaudeCode => config.base_url_on(&host),
+        Harness::Codex => match codex_auth_for(target) {
+            CodexAuth::ChatGpt => config.chatgpt_base_url_on(&host),
+            CodexAuth::ApiKey => config.openai_base_url_on(&host),
+        },
+    })
+}
+
+/// Everything the connector inferred, in one line, before the button is pressed.
+///
+/// The WSL half is not decoration. Under NAT the address written into the guest
+/// is the gateway of a virtual adapter, and that gateway is reassigned when WSL
+/// restarts — at which point a config that was correct becomes a config that
+/// captures nothing. Saying so is the difference between a limitation and a
+/// mystery.
+fn caveat_for(target: &Target, config: &Config) -> Option<String> {
+    let harness = target
+        .harness
+        .caveat(codex_auth_for(target))
+        .map(str::to_owned);
+
+    let Site::Wsl(name) = &target.site else {
+        return harness;
+    };
+
+    let bridging = match distro(name).ok() {
+        None => Some(format!(
+            "{name} was not reachable when this page was read, so its paths could not be resolved."
+        )),
+        Some(distro) if !distro.is_wsl2() => None,
+        Some(distro) => match wsl::networking() {
+            wsl::Networking::Mirrored => None,
+            wsl::Networking::Nat => Some(match distro.gateway {
+                // Whether we are *actually* listening there is read off the
+                // bound config rather than assumed from having wanted to. A
+                // bridge that failed to bind is exactly the case where claiming
+                // otherwise sends someone hunting through their harness for a
+                // problem that is on this side.
+                Some(gateway) if config.extra_hosts.contains(&gateway) => format!(
+                    "{name} is behind a NAT, so it reaches this proxy at {gateway} rather than \
+                     127.0.0.1, and the proxy is listening there as well. That address is \
+                     reassigned when WSL restarts — reconnect if capture stops. Setting \
+                     networkingMode=mirrored in .wslconfig makes it 127.0.0.1 for good."
+                ),
+                Some(gateway) => format!(
+                    "{name} is behind a NAT and would reach this proxy at {gateway}, but the proxy \
+                     could not listen on that address, so connecting would not capture anything. \
+                     Restart Orama once the distribution is running, or set \
+                     networkingMode=mirrored in .wslconfig to reach it on 127.0.0.1 instead."
+                ),
+                None => format!("No route from {name} to Windows could be found."),
+            }),
+        },
+    };
+
+    // A relocated config directory is worth stating because it is the surprising
+    // part of the answer, and because it is the one thing here we inferred by
+    // running a shell inside someone else's distro.
+    let relocated = distro(name).ok().and_then(|distro| {
+        distro
+            .config_dir_is_overridden(target.harness)
+            .then(|| format!("{} is set in {name}.", target.harness.config_dir_var()))
+    });
+
+    let joined: Vec<String> = [harness, bridging, relocated]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!joined.is_empty()).then(|| joined.join(" "))
+}
+
+fn status(target: &Target, config: &Config, state: &ConnectionState) -> HarnessStatus {
+    let (site, distro_name) = match &target.site {
+        Site::Local => ("local", None),
+        Site::Wsl(name) => ("wsl", Some(name.clone())),
+    };
+
+    let blank = |error: String| HarnessStatus {
+        id: target.id(),
+        label: target.label(),
+        site,
+        distro: distro_name.clone(),
+        config_path: String::new(),
+        config_exists: false,
+        connected: false,
+        base_url: None,
+        expected_base_url: None,
+        managed: false,
+        effect: target.harness.effect(),
+        caveat: caveat_for(target, config),
+        restart_required: target.harness.restart_required(),
+        error: Some(error),
+    };
+
+    let path = match config_path(target) {
+        Ok(path) => path,
+        Err(err) => return blank(err.to_string()),
+    };
+
+    // An unresolvable base URL is reported without hiding the rest: the path is
+    // still worth showing, and so is whatever the config currently says.
+    let (expected, route_error) = match expected_base_url(target, config) {
+        Ok(url) => (Some(url), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+
+    let (base_url, read_error) = match read_base_url(target.harness, &path) {
         Ok(url) => (url, None),
         Err(err) => (None, Some(err.to_string())),
     };
 
     HarnessStatus {
-        id: harness.id(),
-        label: harness.label(),
+        id: target.id(),
+        label: target.label(),
+        site,
+        distro: distro_name,
         config_path: path.display().to_string(),
         config_exists: path.exists(),
-        connected: base_url.as_deref() == Some(expected.as_str()),
+        connected: expected.is_some() && base_url == expected,
         base_url,
-        managed: state.get(harness).is_some(),
-        effect: harness.effect(),
-        caveat: harness.caveat(),
-        restart_required: harness.restart_required(),
-        error,
+        expected_base_url: expected,
+        managed: state.get(target).is_some(),
+        effect: target.harness.effect(),
+        caveat: caveat_for(target, config),
+        restart_required: target.harness.restart_required(),
+        error: read_error.or(route_error),
     }
 }
 
@@ -441,13 +717,47 @@ fn is_our_base_url(url: &str) -> bool {
 /// builds, so their *absence* is what identifies the common case. Guessing
 /// wrong is cheap to correct and visible on the settings page either way.
 pub fn codex_auth() -> CodexAuth {
-    if std::env::var_os("OPENAI_API_KEY").is_some_and(|key| !key.is_empty()) {
+    codex_auth_for(&Target::local(Harness::Codex))
+}
+
+/// How the Codex at this particular target authenticates.
+///
+/// Which environment to look in is part of the question, not an implementation
+/// detail. A Codex inside WSL reads the guest's `OPENAI_API_KEY`, and inspecting
+/// this process's instead would write the wrong provider shape — the mistake
+/// that stops a subscription install from starting at all.
+pub fn codex_auth_for(target: &Target) -> CodexAuth {
+    if target.harness != Harness::Codex {
+        // Meaningless for anything else, and the caller only uses it to pick
+        // Codex's caveat and base URL.
+        return CodexAuth::ChatGpt;
+    }
+
+    let from_env = match &target.site {
+        Site::Local => std::env::var_os("OPENAI_API_KEY").is_some_and(|key| !key.is_empty()),
+        Site::Wsl(name) => distro(name)
+            .ok()
+            .and_then(|distro| distro.env_var("OPENAI_API_KEY").map(str::to_owned))
+            .is_some_and(|key| !key.is_empty()),
+    };
+    if from_env {
         return CodexAuth::ApiKey;
     }
-    // Older installs keep a key in auth.json rather than the environment.
-    let has_key_file = config_path(Harness::Codex)
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join("auth.json")))
+
+    // Older installs keep a key in auth.json rather than the environment. Its
+    // path is asked of the distro for a WSL target rather than derived from the
+    // config path, because `parent` and `join` on a Windows path are only
+    // meaningful when Windows is what is running.
+    let auth_path = match &target.site {
+        Site::Local => config_path(target)
+            .ok()
+            .and_then(|path| path.parent().map(|dir| dir.join("auth.json"))),
+        Site::Wsl(name) => distro(name)
+            .ok()
+            .map(|distro| distro.windows_config_sibling(target.harness, "auth.json")),
+    };
+
+    let has_key_file = auth_path
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .is_some_and(|auth| {
@@ -459,17 +769,6 @@ pub fn codex_auth() -> CodexAuth {
         CodexAuth::ApiKey
     } else {
         CodexAuth::ChatGpt
-    }
-}
-
-/// The base URL this harness should be pointed at to reach us.
-pub fn expected_base_url(harness: Harness, config: &Config) -> String {
-    match harness {
-        Harness::ClaudeCode => config.public_base_url(),
-        Harness::Codex => match codex_auth() {
-            CodexAuth::ChatGpt => config.chatgpt_base_url(),
-            CodexAuth::ApiKey => config.openai_base_url(),
-        },
     }
 }
 
@@ -544,7 +843,9 @@ fn parse_toml(path: &Path, text: &str) -> Result<toml_edit::DocumentMut, Connect
 /// The result of a write, detailed enough for the UI to say what happened.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectOutcome {
-    pub harness: &'static str,
+    /// The target id — the bare harness id locally, `harness@distro` in WSL.
+    /// Named `harness` still because it is what the dashboard has always read.
+    pub harness: String,
     pub config_path: String,
     /// Where the untouched original was copied, if there was one to copy.
     pub backup_path: Option<String>,
@@ -554,9 +855,20 @@ pub struct ConnectOutcome {
 }
 
 /// Point a harness at this proxy.
-pub fn connect(harness: Harness, config: &Config) -> Result<ConnectOutcome, ConnectError> {
-    let path = config_path(harness)?;
-    let base = expected_base_url(harness, config);
+pub fn connect(target: &Target, config: &Config) -> Result<ConnectOutcome, ConnectError> {
+    let harness = target.harness;
+
+    // Take the discovery again before writing. Under NAT the address a guest
+    // reaches us on is reassigned when WSL restarts, and a cached one would be
+    // written into a config that then captures nothing.
+    if let Site::Wsl(name) = &target.site {
+        if wsl::probe_named(name).is_none() {
+            return Err(ConnectError::NoDistro(name.clone()));
+        }
+    }
+
+    let path = config_path(target)?;
+    let base = expected_base_url(target, config)?;
 
     // Refuse to write over a file we could not parse: replacing a config we do
     // not understand would destroy settings we never read.
@@ -564,11 +876,11 @@ pub fn connect(harness: Harness, config: &Config) -> Result<ConnectOutcome, Conn
     if previous.as_deref() == Some(base.as_str()) && is_current_shape(harness, &path) {
         let state = ConnectionState::load();
         return Ok(ConnectOutcome {
-            harness: harness.id(),
+            harness: target.id(),
             config_path: path.display().to_string(),
             backup_path: None,
             already: true,
-            status: status(harness, config, &state),
+            status: status(target, config, &state),
         });
     }
 
@@ -665,7 +977,7 @@ pub fn connect(harness: Harness, config: &Config) -> Result<ConnectOutcome, Conn
             // The reason this is a provider entry at all: without it every
             // session opens with a WebSocket probe Orama cannot proxy.
             entry["supports_websockets"] = toml_edit::value(false);
-            match codex_auth() {
+            match codex_auth_for(target) {
                 // Hand the request to Codex's own credentials. Naming an
                 // `env_key` here is what broke subscription installs.
                 CodexAuth::ChatGpt => entry["requires_openai_auth"] = toml_edit::value(true),
@@ -678,15 +990,15 @@ pub fn connect(harness: Harness, config: &Config) -> Result<ConnectOutcome, Conn
     }
 
     let mut state = ConnectionState::load();
-    state.entries.insert(harness.id().to_owned(), record);
+    state.entries.insert(target.id(), record);
     state.save()?;
 
     Ok(ConnectOutcome {
-        harness: harness.id(),
+        harness: target.id(),
         config_path: path.display().to_string(),
         backup_path: backup.map(|p| p.display().to_string()),
         already: false,
-        status: status(harness, config, &state),
+        status: status(target, config, &state),
     })
 }
 
@@ -694,24 +1006,41 @@ pub fn connect(harness: Harness, config: &Config) -> Result<ConnectOutcome, Conn
 ///
 /// Only touches a value that points at us. A base URL someone else configured
 /// is left exactly as found, and the call reports that nothing changed.
-pub fn disconnect(harness: Harness, config: &Config) -> Result<ConnectOutcome, ConnectError> {
-    let path = config_path(harness)?;
-    let expected = expected_base_url(harness, config);
+pub fn disconnect(target: &Target, config: &Config) -> Result<ConnectOutcome, ConnectError> {
+    let harness = target.harness;
+    let path = config_path(target)?;
     let current = read_base_url(harness, &path)?;
 
     let mut state = ConnectionState::load();
-    let record = state.get(harness).cloned();
+    let record = state.get(target).cloned();
 
-    if current.as_deref() != Some(expected.as_str()) {
+    // What we would write now is normally what we wrote before, but under NAT
+    // the address can have moved since. So the value recorded at connect time is
+    // the primary test of "is this ours", with the current expectation as a
+    // fallback for a state file that was lost — otherwise a WSL restart would
+    // strand a config we wrote and are no longer willing to remove.
+    let ours: Vec<String> = [
+        record
+            .as_ref()
+            .and_then(|entry| entry.get("base_url"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        expected_base_url(target, config).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if !current.as_ref().is_some_and(|url| ours.contains(url)) {
         // Nothing of ours in the file; drop our bookkeeping and report it.
-        state.entries.remove(harness.id());
+        state.entries.remove(&target.id());
         let _ = state.save();
         return Ok(ConnectOutcome {
-            harness: harness.id(),
+            harness: target.id(),
             config_path: path.display().to_string(),
             backup_path: None,
             already: true,
-            status: status(harness, config, &state),
+            status: status(target, config, &state),
         });
     }
 
@@ -791,15 +1120,15 @@ pub fn disconnect(harness: Harness, config: &Config) -> Result<ConnectOutcome, C
         }
     }
 
-    state.entries.remove(harness.id());
+    state.entries.remove(&target.id());
     state.save()?;
 
     Ok(ConnectOutcome {
-        harness: harness.id(),
+        harness: target.id(),
         config_path: path.display().to_string(),
         backup_path: None,
         already: false,
-        status: status(harness, config, &state),
+        status: status(target, config, &state),
     })
 }
 
@@ -826,6 +1155,10 @@ mod tests {
             std::env::set_var("CLAUDE_CONFIG_DIR", dir.join("claude"));
             std::env::set_var("CODEX_HOME", dir.join("codex"));
             std::env::set_var("ORAMA_HOME", dir.join("orama"));
+            // Discovery spawns `wsl.exe`. On a Windows dev machine these tests
+            // would start every installed distro and run a shell inside it, so
+            // the whole suite stays on the local site.
+            std::env::set_var("ORAMA_WSL", "0");
             Self { _guard: guard, dir }
         }
     }
@@ -835,6 +1168,7 @@ mod tests {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("CODEX_HOME");
             std::env::remove_var("ORAMA_HOME");
+            std::env::remove_var("ORAMA_WSL");
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
@@ -843,10 +1177,18 @@ mod tests {
         Config::default()
     }
 
+    fn cc() -> Target {
+        Target::local(Harness::ClaudeCode)
+    }
+
+    fn cx() -> Target {
+        Target::local(Harness::Codex)
+    }
+
     #[test]
     fn claude_code_connect_then_disconnect_leaves_no_trace() {
         let _sandbox = Sandbox::new("cc-roundtrip");
-        let path = config_path(Harness::ClaudeCode).unwrap();
+        let path = config_path(&cc()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
@@ -854,14 +1196,14 @@ mod tests {
         )
         .unwrap();
 
-        connect(Harness::ClaudeCode, &config()).unwrap();
+        connect(&cc(), &config()).unwrap();
         let after: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
         // Unrelated settings survive the edit.
         assert_eq!(after["theme"], "dark");
         assert_eq!(after["permissions"]["allow"][0], "Bash");
 
-        disconnect(Harness::ClaudeCode, &config()).unwrap();
+        disconnect(&cc(), &config()).unwrap();
         let restored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(restored["theme"], "dark");
         // The env block existed only to hold our key, so it goes too.
@@ -871,7 +1213,7 @@ mod tests {
     #[test]
     fn claude_code_disconnect_restores_a_previous_base_url() {
         let _sandbox = Sandbox::new("cc-restore");
-        let path = config_path(Harness::ClaudeCode).unwrap();
+        let path = config_path(&cc()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
@@ -879,8 +1221,8 @@ mod tests {
         )
         .unwrap();
 
-        connect(Harness::ClaudeCode, &config()).unwrap();
-        disconnect(Harness::ClaudeCode, &config()).unwrap();
+        connect(&cc(), &config()).unwrap();
+        disconnect(&cc(), &config()).unwrap();
 
         let restored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -892,10 +1234,10 @@ mod tests {
     #[test]
     fn connecting_creates_a_config_that_did_not_exist() {
         let _sandbox = Sandbox::new("cc-fresh");
-        let path = config_path(Harness::ClaudeCode).unwrap();
+        let path = config_path(&cc()).unwrap();
         assert!(!path.exists());
 
-        let outcome = connect(Harness::ClaudeCode, &config()).unwrap();
+        let outcome = connect(&cc(), &config()).unwrap();
         assert!(path.exists());
         assert!(outcome.status.connected);
         // Nothing existed to back up.
@@ -905,7 +1247,7 @@ mod tests {
     #[test]
     fn codex_connect_leaves_auth_and_providers_untouched() {
         let _sandbox = Sandbox::new("codex-preserve");
-        let path = config_path(Harness::Codex).unwrap();
+        let path = config_path(&cx()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
@@ -914,7 +1256,7 @@ mod tests {
         )
         .unwrap();
 
-        connect(Harness::Codex, &config()).unwrap();
+        connect(&cx(), &config()).unwrap();
         let after = fs::read_to_string(&path).unwrap();
         assert!(
             after.contains("# my notes"),
@@ -931,7 +1273,7 @@ mod tests {
         // The user's own provider is left intact alongside ours.
         assert!(after.contains("[model_providers.mine]"), "{after}");
 
-        disconnect(Harness::Codex, &config()).unwrap();
+        disconnect(&cx(), &config()).unwrap();
         let restored = fs::read_to_string(&path).unwrap();
         assert!(restored.contains("model_provider = \"mine\""), "{restored}");
         assert!(restored.contains("[model_providers.mine]"), "{restored}");
@@ -945,8 +1287,8 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
         assert_eq!(codex_auth(), CodexAuth::ChatGpt);
 
-        connect(Harness::Codex, &config()).unwrap();
-        let written = fs::read_to_string(config_path(Harness::Codex).unwrap()).unwrap();
+        connect(&cx(), &config()).unwrap();
+        let written = fs::read_to_string(config_path(&cx()).unwrap()).unwrap();
         // Subscription auth talks to a different backend under a different
         // path prefix; api.openai.com/v1 would 404 it however well it parsed.
         // That prefix is also what routes it back out again.
@@ -961,7 +1303,7 @@ mod tests {
     fn a_config_connected_by_the_old_base_url_scheme_disconnects_cleanly() {
         let _sandbox = Sandbox::new("codex-legacy");
         std::env::remove_var("OPENAI_API_KEY");
-        let path = config_path(Harness::Codex).unwrap();
+        let path = config_path(&cx()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         // What an earlier build of this connector wrote.
         fs::write(
@@ -971,17 +1313,17 @@ mod tests {
         .unwrap();
 
         // It still reads as connected, rather than looking like a stranger's.
-        let status = status(Harness::Codex, &config(), &ConnectionState::load());
+        let status = status(&cx(), &config(), &ConnectionState::load());
         assert!(status.connected, "{status:?}");
 
         // Re-connecting replaces it instead of leaving two settings that
         // disagree about where traffic goes.
-        connect(Harness::Codex, &config()).unwrap();
+        connect(&cx(), &config()).unwrap();
         let after = fs::read_to_string(&path).unwrap();
         assert!(!after.contains("openai_base_url"), "{after}");
         assert!(after.contains("[model_providers.orama]"), "{after}");
 
-        disconnect(Harness::Codex, &config()).unwrap();
+        disconnect(&cx(), &config()).unwrap();
         let restored = fs::read_to_string(&path).unwrap();
         assert!(!restored.contains("openai_base_url"), "{restored}");
         assert!(!restored.contains("orama"), "{restored}");
@@ -991,12 +1333,12 @@ mod tests {
     #[test]
     fn a_base_url_the_user_set_themselves_is_left_alone() {
         let _sandbox = Sandbox::new("codex-foreign-base");
-        let path = config_path(Harness::Codex).unwrap();
+        let path = config_path(&cx()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "openai_base_url = \"https://gateway.internal/v1\"\n").unwrap();
 
-        connect(Harness::Codex, &config()).unwrap();
-        disconnect(Harness::Codex, &config()).unwrap();
+        connect(&cx(), &config()).unwrap();
+        disconnect(&cx(), &config()).unwrap();
         let restored = fs::read_to_string(&path).unwrap();
         assert!(
             restored.contains("openai_base_url = \"https://gateway.internal/v1\""),
@@ -1010,8 +1352,8 @@ mod tests {
         std::env::set_var("OPENAI_API_KEY", "sk-test");
         assert_eq!(codex_auth(), CodexAuth::ApiKey);
 
-        let written = connect(Harness::Codex, &config()).and_then(|_| {
-            fs::read_to_string(config_path(Harness::Codex).unwrap())
+        let written = connect(&cx(), &config()).and_then(|_| {
+            fs::read_to_string(config_path(&cx()).unwrap())
                 .map_err(|err| io_err(Path::new("codex"), err))
         });
         std::env::remove_var("OPENAI_API_KEY");
@@ -1031,18 +1373,18 @@ mod tests {
     #[test]
     fn a_backup_never_captures_our_own_output() {
         let _sandbox = Sandbox::new("cc-twice");
-        let path = config_path(Harness::ClaudeCode).unwrap();
+        let path = config_path(&cc()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, r#"{"theme":"light"}"#).unwrap();
 
-        let first = connect(Harness::ClaudeCode, &config()).unwrap();
+        let first = connect(&cc(), &config()).unwrap();
         assert!(!first.already);
         let backup = first.backup_path.clone().unwrap();
         assert!(fs::read_to_string(&backup).unwrap().contains("light"));
 
         // Re-connecting while already connected does not reach the backup step
         // at all, so our own output can never become the "original".
-        let second = connect(Harness::ClaudeCode, &config()).unwrap();
+        let second = connect(&cc(), &config()).unwrap();
         assert!(second.already);
         assert!(!fs::read_to_string(&backup)
             .unwrap()
@@ -1050,9 +1392,9 @@ mod tests {
 
         // After a genuine round trip the backup refreshes to whatever the user
         // has now, rather than pinning the first file we ever saw.
-        disconnect(Harness::ClaudeCode, &config()).unwrap();
+        disconnect(&cc(), &config()).unwrap();
         fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
-        connect(Harness::ClaudeCode, &config()).unwrap();
+        connect(&cc(), &config()).unwrap();
         let saved = fs::read_to_string(&backup).unwrap();
         assert!(saved.contains("dark"), "{saved}");
         assert!(!saved.contains("ANTHROPIC_BASE_URL"), "{saved}");
@@ -1061,11 +1403,11 @@ mod tests {
     #[test]
     fn a_malformed_config_is_refused_rather_than_overwritten() {
         let _sandbox = Sandbox::new("cc-malformed");
-        let path = config_path(Harness::ClaudeCode).unwrap();
+        let path = config_path(&cc()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "{ not json at all").unwrap();
 
-        let result = connect(Harness::ClaudeCode, &config());
+        let result = connect(&cc(), &config());
         assert!(matches!(result, Err(ConnectError::Malformed { .. })));
         // The file is exactly as the user left it.
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json at all");
@@ -1074,20 +1416,205 @@ mod tests {
     #[test]
     fn disconnecting_a_base_url_we_did_not_set_changes_nothing() {
         let _sandbox = Sandbox::new("cc-foreign");
-        let path = config_path(Harness::ClaudeCode).unwrap();
+        let path = config_path(&cc()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let original = r#"{"env":{"ANTHROPIC_BASE_URL":"https://someone-elses-proxy.test"}}"#;
         fs::write(&path, original).unwrap();
 
-        let outcome = disconnect(Harness::ClaudeCode, &config()).unwrap();
+        let outcome = disconnect(&cc(), &config()).unwrap();
         assert!(outcome.already);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
+    fn a_local_target_keeps_the_bare_harness_id() {
+        // The state file is keyed by this string. Changing it for a local
+        // harness would orphan every record of what we overwrote, so a config
+        // connected by an earlier build could no longer be put back.
+        assert_eq!(cc().id(), "claude-code");
+        assert_eq!(cx().id(), "codex");
+        assert_eq!(Target::parse("claude-code"), Some(cc()));
+        assert_eq!(Target::parse("codex"), Some(cx()));
+    }
+
+    #[test]
+    fn a_wsl_target_round_trips_through_its_id() {
+        let target = Target {
+            harness: Harness::ClaudeCode,
+            site: Site::Wsl("Ubuntu".into()),
+        };
+        assert_eq!(target.id(), "claude-code@Ubuntu");
+        assert_eq!(Target::parse("claude-code@Ubuntu"), Some(target));
+        assert_eq!(Target::parse("claude-code@"), None);
+        assert_eq!(Target::parse("nonesuch@Ubuntu"), None);
+        // A distro whose name contains a dash or a dot is still one segment.
+        assert_eq!(
+            Target::parse("codex@Ubuntu-24.04").map(|t| t.id()),
+            Some("codex@Ubuntu-24.04".to_owned())
+        );
+    }
+
+    #[test]
+    fn disconnect_restores_a_config_whose_address_has_since_moved() {
+        // The NAT case, reduced to something testable without a distro: we
+        // wrote an address, and by the time the user disconnects the address we
+        // *would* write has changed. Comparing only against the current
+        // expectation would decide the file was not ours and strand a setting
+        // that points at a proxy about to stop.
+        let _sandbox = Sandbox::new("cc-moved");
+        let path = config_path(&cc()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.internal"}}"#,
+        )
+        .unwrap();
+
+        connect(&cc(), &config()).unwrap();
+
+        // Same proxy, different address — as if WSL had been restarted under it.
+        let moved = Config {
+            port: 9999,
+            ..config()
+        };
+        let outcome = disconnect(&cc(), &moved).unwrap();
+        assert!(
+            !outcome.already,
+            "a value we wrote is ours to remove even at an address that has moved"
+        );
+
+        let restored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            restored["env"]["ANTHROPIC_BASE_URL"], "https://gateway.internal",
+            "the user's own base URL must come back: {restored}"
+        );
+    }
+
+    #[test]
+    fn a_stranger_at_a_moved_address_is_still_left_alone() {
+        // The other side of the same coin: widening what counts as "ours" must
+        // not start claiming values we never wrote.
+        let _sandbox = Sandbox::new("cc-moved-foreign");
+        let path = config_path(&cc()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"{"env":{"ANTHROPIC_BASE_URL":"https://someone-elses-proxy.test"}}"#;
+        fs::write(&path, original).unwrap();
+
+        let outcome = disconnect(&cc(), &config()).unwrap();
+        assert!(outcome.already);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// A NAT-mode WSL 2 distro with a relocated config directory — this
+    /// machine's real shape, as recorded by the live probe.
+    fn seeded_ubuntu() {
+        std::env::set_var("ORAMA_WSL", "1");
+        let distro = wsl::distro_from_probe(
+            "Ubuntu",
+            &[
+                ("orama.home", "/home/elie"),
+                ("orama.kernel", "6.18.33.2-microsoft-standard-WSL2"),
+                ("orama.gateway", "172.17.160.1"),
+                ("CLAUDE_CONFIG_DIR", "/home/elie/.ai/claude"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        )
+        .unwrap();
+        wsl::seed_cache(vec![distro]);
+    }
+
+    fn gateway() -> std::net::IpAddr {
+        "172.17.160.1".parse().unwrap()
+    }
+
+    #[test]
+    fn a_wsl_harness_is_pointed_at_the_address_it_can_actually_reach() {
+        let _sandbox = Sandbox::new("wsl-address");
+        seeded_ubuntu();
+        let target = Target {
+            harness: Harness::ClaudeCode,
+            site: Site::Wsl("Ubuntu".into()),
+        };
+
+        // Not bridged: refused outright. 127.0.0.1 would parse, write, and read
+        // back as connected while every request from the guest went nowhere.
+        let err = expected_base_url(&target, &config()).unwrap_err();
+        assert!(
+            matches!(err, ConnectError::NotBridged { .. }),
+            "{err:?} should refuse an address we are not listening on"
+        );
+
+        // Bridged: the gateway, not the loopback.
+        let bridged = Config {
+            extra_hosts: vec![gateway()],
+            ..config()
+        };
+        assert_eq!(
+            expected_base_url(&target, &bridged).unwrap(),
+            "http://172.17.160.1:8787"
+        );
+        // Codex keeps its backend prefix across the substitution, or it arrives
+        // at a route the upstream does not have.
+        let codex = Target {
+            harness: Harness::Codex,
+            site: Site::Wsl("Ubuntu".into()),
+        };
+        assert_eq!(
+            expected_base_url(&codex, &bridged).unwrap(),
+            "http://172.17.160.1:8787/backend-api/codex"
+        );
+
+        // A local harness is unaffected by any of it.
+        assert_eq!(
+            expected_base_url(&cc(), &bridged).unwrap(),
+            "http://127.0.0.1:8787"
+        );
+    }
+
+    #[test]
+    fn wsl_rows_report_the_path_inside_the_distro() {
+        let _sandbox = Sandbox::new("wsl-rows");
+        seeded_ubuntu();
+        let bridged = Config {
+            extra_hosts: vec![gateway()],
+            ..config()
+        };
+
+        let all = status_all(&bridged);
+        let row = all
+            .iter()
+            .find(|s| s.id == "claude-code@Ubuntu")
+            .expect("a discovered distro contributes a row per harness");
+
+        assert_eq!(row.site, "wsl");
+        assert_eq!(row.distro.as_deref(), Some("Ubuntu"));
+        // The override the guest exports, translated onto the share — not the
+        // default path, and not a Windows-side path.
+        assert_eq!(
+            row.config_path,
+            r"\\wsl.localhost\Ubuntu\home\elie\.ai\claude\settings.json"
+        );
+        assert_eq!(
+            row.expected_base_url.as_deref(),
+            Some("http://172.17.160.1:8787")
+        );
+        // The two facts that make a surprising path and a moving address
+        // explicable rather than mysterious.
+        let caveat = row.caveat.clone().unwrap_or_default();
+        assert!(caveat.contains("reassigned when WSL restarts"), "{caveat}");
+        assert!(caveat.contains("CLAUDE_CONFIG_DIR is set"), "{caveat}");
+
+        // The local rows are still there, and still first.
+        assert_eq!(all[0].id, "claude-code");
+        assert_eq!(all[0].site, "local");
+    }
+
+    #[test]
     fn status_reports_where_a_harness_points_when_it_is_not_us() {
         let _sandbox = Sandbox::new("cc-elsewhere");
-        let path = config_path(Harness::ClaudeCode).unwrap();
+        let path = config_path(&cc()).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,

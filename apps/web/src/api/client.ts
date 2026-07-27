@@ -423,6 +423,12 @@ export interface CallContext {
 
 export interface ProxyState {
   listening_on: string;
+  /**
+   * Extra addresses being listened on so a harness inside WSL can reach us.
+   * Not interchangeable with `listening_on`: these are only reachable from a
+   * guest, and under NAT one of them is the only address that works there.
+   */
+  bridged_on: string[];
   base_url: string;
   openai_base_url: string;
   upstream_anthropic: string;
@@ -447,12 +453,23 @@ export interface ProxyState {
 export interface Connector {
   id: string;
   label: string;
+  /** `local`, or `wsl` for a harness inside a distribution. */
+  site: "local" | "wsl";
+  /** Which distribution, when this row is about one. */
+  distro: string | null;
   config_path: string;
   config_exists: boolean;
   /** Points at this proxy specifically, not merely at some proxy. */
   connected: boolean;
   /** Where it currently points; null means straight to the provider. */
   base_url: string | null;
+  /**
+   * What connecting would write. Null means there is no address this target
+   * could reach us on, which is a refusal rather than a default — reported by
+   * the server because it depends on Codex's auth mode and on which side of a
+   * WSL boundary the harness sits.
+   */
+  expected_base_url: string | null;
   /** We wrote the current value, so disconnecting can restore what was there. */
   managed: boolean;
   effect: string;

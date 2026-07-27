@@ -21,7 +21,18 @@
 //! an agent session already running — both harnesses read their config at
 //! startup, so a live session keeps dialling a port that is no longer
 //! listening — but it does mean the next session started after quitting talks
-//! straight to the provider instead of a dead socket.
+//! straight to the provider instead of a dead socket. Harnesses inside WSL are
+//! restored the same way, with one more limit that is real: the restore edits a
+//! file over the distribution's share, so a distribution shut down before the
+//! app quits keeps a config pointing at a proxy that has stopped. The failure is
+//! reported on stderr and quitting continues, because refusing to exit over it
+//! would strand the window.
+//!
+//! **Which addresses does it listen on?** Loopback, plus the WSL virtual adapter
+//! when a NAT-mode distribution is present — resolved before binding, because
+//! that is the only moment a listener can be added. See `connect::wsl` for why a
+//! guest cannot use loopback at all, and why the extra bind is one specific
+//! address and never `0.0.0.0`.
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -34,7 +45,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use orama_core::config::{Config, DEFAULT_PORT};
-use orama_core::connect::{self, Harness};
+use orama_core::connect::{self, Target};
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 /// Marker state: this process started the proxy, so this process is
@@ -178,6 +189,24 @@ fn desktop_config() -> Config {
     if let Some(upstream) = env_value("ORAMA_UPSTREAM_OPENAI") {
         config = config.with_openai_upstream(upstream);
     }
+
+    // A harness inside WSL cannot reach a listener bound only to the Windows
+    // loopback — so on a machine with a NAT-mode distro, also listen on the
+    // virtual adapter it routes through. Resolved before binding because that is
+    // the only moment a listener can be added, and empty everywhere else: off
+    // Windows, under mirrored networking, and on WSL 1, loopback already works.
+    let bridges = connect::wsl::bridge_hosts();
+    if !bridges.is_empty() {
+        eprintln!(
+            "orama: bridging to WSL on {}",
+            bridges
+                .iter()
+                .map(|host| host.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        config = config.with_extra_hosts(bridges);
+    }
     config
 }
 
@@ -218,10 +247,10 @@ fn restore_harnesses(config: &Config) {
         if !status.connected {
             continue;
         }
-        let Some(harness) = Harness::parse(status.id) else {
+        let Some(target) = Target::parse(&status.id) else {
             continue;
         };
-        match connect::disconnect(harness, config) {
+        match connect::disconnect(&target, config) {
             Ok(_) => eprintln!("orama: disconnected {} on exit", status.label),
             Err(err) => eprintln!(
                 "orama: could not restore {} ({}): {err}",
@@ -333,6 +362,9 @@ mod tests {
             std::env::set_var("CLAUDE_CONFIG_DIR", dir.join("claude"));
             std::env::set_var("CODEX_HOME", dir.join("codex"));
             std::env::set_var("ORAMA_HOME", dir.join("orama"));
+            // No distro discovery: a test must not spawn wsl.exe, and on a
+            // Windows dev machine it otherwise would.
+            std::env::set_var("ORAMA_WSL", "0");
             Self(dir)
         }
 
@@ -346,6 +378,7 @@ mod tests {
             std::env::remove_var("CLAUDE_CONFIG_DIR");
             std::env::remove_var("CODEX_HOME");
             std::env::remove_var("ORAMA_HOME");
+            std::env::remove_var("ORAMA_WSL");
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -364,7 +397,11 @@ mod tests {
         )
         .unwrap();
 
-        connect::connect(Harness::ClaudeCode, &config).unwrap();
+        connect::connect(
+            &Target::local(orama_core::connect::Harness::ClaudeCode),
+            &config,
+        )
+        .unwrap();
         let connected = std::fs::read_to_string(sandbox.claude_settings()).unwrap();
         assert!(
             connected.contains(&config.public_base_url()),

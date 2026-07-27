@@ -68,7 +68,7 @@ function SettingsBody({ data }: { data: SettingsData }) {
   return (
     <>
       <Proxy proxy={data.proxy} />
-      <Connectors connectors={data.connectors} proxy={data.proxy} />
+      <Connectors connectors={data.connectors} />
       <Catalog catalog={data.proxy.catalog} />
       <Guides guides={data.guides} />
     </>
@@ -100,6 +100,17 @@ function Proxy({ proxy }: { proxy: ProxyState }) {
       )}
       <dl className="grid grid-cols-1 gap-x-6 gap-y-px p-3 sm:grid-cols-2">
         <Field label="Listening on" value={proxy.listening_on} mono />
+        {proxy.bridged_on?.length > 0 && (
+          // Only shown when there is one, because it is not a general fact
+          // about the proxy — it is the address a WSL guest reaches it on, and
+          // on most machines there is no such address.
+          <Field
+            label="Bridged to WSL"
+            value={proxy.bridged_on.join(", ")}
+            title="A harness inside WSL cannot reach the Windows loopback, so the proxy also listens here."
+            mono
+          />
+        )}
         <Field
           label="Last capture"
           value={proxy.last_capture_at ? ago(proxy.last_capture_at) : "never"}
@@ -255,13 +266,7 @@ function Field({
 
 /* ── connectors ───────────────────────────────────────────────────────── */
 
-function Connectors({
-  connectors,
-  proxy,
-}: {
-  connectors: Connector[];
-  proxy: ProxyState;
-}) {
+function Connectors({ connectors }: { connectors: Connector[] }) {
   return (
     <Panel title="Connectors">
       <p className="border-b border-border px-3 py-2 text-2xs text-faint">
@@ -271,20 +276,14 @@ function Connectors({
       </p>
       <ul>
         {connectors.map((connector) => (
-          <ConnectorRow key={connector.id} connector={connector} proxy={proxy} />
+          <ConnectorRow key={connector.id} connector={connector} />
         ))}
       </ul>
     </Panel>
   );
 }
 
-function ConnectorRow({
-  connector,
-  proxy,
-}: {
-  connector: Connector;
-  proxy: ProxyState;
-}) {
+function ConnectorRow({ connector }: { connector: Connector }) {
   const client = useQueryClient();
   const [outcome, setOutcome] = React.useState<string | null>(null);
 
@@ -304,12 +303,11 @@ function ConnectorRow({
     onError: () => setOutcome(null),
   });
 
-  // Codex's base depends on how it authenticates, so the server is the only
-  // thing that knows it. Fall back to what it reports rather than recomputing.
-  const expected =
-    connector.id === "codex"
-      ? (connector.connected ? connector.base_url : null) ?? proxy.openai_base_url
-      : proxy.base_url;
+  // What connecting writes depends on Codex's auth mode and on which side of a
+  // WSL boundary the harness sits, so the server reports it outright. This used
+  // to be reconstructed here from the connector id, which stopped being
+  // sufficient the moment one harness could exist at more than one place.
+  const expected = connector.expected_base_url;
   // A base URL that is neither ours nor absent belongs to someone else, and
   // connecting would silently take it over. Say so rather than just doing it.
   const foreign =
@@ -321,6 +319,14 @@ function ConnectorRow({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium">{connector.label}</span>
+            {connector.site === "wsl" && (
+              <Pill
+                tone="unknown"
+                title="This harness lives inside a WSL distribution, and is reached across that boundary."
+              >
+                wsl
+              </Pill>
+            )}
             {connector.error ? (
               <Pill tone="error">unreadable</Pill>
             ) : connector.connected ? (
@@ -380,7 +386,20 @@ function ConnectorRow({
         </div>
 
         <button
-          disabled={mutation.isPending || !!connector.error}
+          // No expected base URL means there is no address this harness could
+          // reach us on, so connecting could only write a config that fails
+          // every request. Disconnecting stays available: something may still
+          // need putting back.
+          disabled={
+            mutation.isPending ||
+            !!connector.error ||
+            (!connector.connected && expected == null)
+          }
+          title={
+            !connector.connected && expected == null
+              ? "There is no address this harness could reach the proxy on."
+              : undefined
+          }
           onClick={() => {
             setOutcome(null);
             mutation.mutate(connector.connected ? "disconnect" : "connect");

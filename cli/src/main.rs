@@ -51,6 +51,15 @@ enum Command {
         /// Path to the SQLite capture database.
         #[arg(long, default_value = "orama.sqlite")]
         db: std::path::PathBuf,
+
+        /// Do not also listen on the address a WSL guest can reach.
+        ///
+        /// On Windows with a NAT-mode distribution, the proxy listens on the
+        /// virtual adapter as well as loopback, because a harness inside the
+        /// distro cannot reach loopback at all. This turns that off; nothing
+        /// changes on any other platform, where the bridge is never added.
+        #[arg(long)]
+        no_wsl_bridge: bool,
     },
 
     /// Rebuild the derived analytics tables from the raw captures.
@@ -121,11 +130,19 @@ async fn main() -> anyhow::Result<()> {
             upstream_openai,
             upstream_chatgpt,
             db,
+            no_wsl_bridge,
         } => {
-            let config = Config::new(host, port, upstream)
+            let mut config = Config::new(host, port, upstream)
                 .with_openai_upstream(upstream_openai)
                 .with_chatgpt_upstream(upstream_chatgpt)
                 .with_db_path(db);
+
+            // The same bridge the desktop shell adds. Here too, or `orama start`
+            // on Windows would be reachable from everything on the machine
+            // except the distro the user actually runs their agent in.
+            if !no_wsl_bridge {
+                config = config.with_extra_hosts(orama_core::connect::wsl::bridge_hosts());
+            }
             orama_core::serve(config).await?;
         }
         Command::Derive { db, rebuild } => {
